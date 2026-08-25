@@ -155,18 +155,18 @@ use windows::Win32::UI::Input::KeyboardAndMouse::VK_SHIFT;
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, EnumWindows, FindWindowExW, FindWindowW, GetClassNameW, GetClientRect,
     GetCursorPos, GetForegroundWindow, GetSystemMetrics, GetWindow, GetWindowLongPtrW,
-    GetWindowLongW, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
-    IsWindow, IsWindowVisible, KillTimer, MessageBoxW, PeekMessageW, PostMessageW,
-    SendMessageTimeoutW, SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowLongW,
-    SystemParametersInfoW, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE,
-    EVENT_OBJECT_SHOW, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
-    EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND, GWLP_USERDATA, GWL_EXSTYLE, GWL_STYLE,
-    GW_OWNER, MB_ICONERROR, MB_OK, PM_REMOVE, PW_RENDERFULLCONTENT, SMTO_ABORTIFHUNG, SM_CXSCREEN,
-    SM_CYSCREEN, SPIF_SENDCHANGE, SPIF_UPDATEINIFILE, SPI_GETWORKAREA, SPI_SETDESKWALLPAPER,
-    SPI_SETFOREGROUNDLOCKTIMEOUT, SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
-    WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_CLIPBOARDUPDATE, WM_CLOSE, WM_DISPLAYCHANGE,
-    WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND, WM_PAINT, WM_QUERYENDSESSION, WM_TIMER, WM_USER,
-    WS_CHILD,
+    GetWindowLongW, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
+    IsHungAppWindow, IsIconic, IsWindow, IsWindowVisible, KillTimer, MessageBoxW, PeekMessageW,
+    PostMessageW, SendMessageTimeoutW, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
+    SetWindowLongW, SystemParametersInfoW, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE,
+    EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_SHOW,
+    EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART,
+    EVENT_SYSTEM_MOVESIZEEND, GWLP_USERDATA, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, MB_ICONERROR, MB_OK,
+    PM_REMOVE, PW_RENDERFULLCONTENT, SMTO_ABORTIFHUNG, SM_CXSCREEN, SM_CYSCREEN, SPIF_SENDCHANGE,
+    SPIF_UPDATEINIFILE, SPI_GETWORKAREA, SPI_SETDESKWALLPAPER, SPI_SETFOREGROUNDLOCKTIMEOUT,
+    SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
+    WM_CLIPBOARDUPDATE, WM_CLOSE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND,
+    WM_PAINT, WM_QUERYENDSESSION, WM_TIMER, WM_USER, WS_CHILD,
 };
 
 // =========================================================================
@@ -1593,6 +1593,11 @@ enum Cmd {
     SetLayout(String),
     ToggleScratchpad,
     Reload(Box<Config>), // config file changed on disk; apply live
+    /// The focused window renamed itself (browser tab, editor file, download
+    /// progress). Nothing to re-tile — the manager loop repaints the bar after
+    /// every command, and `update_bar` only repaints monitors whose data
+    /// actually changed, so coalescing is free.
+    BarRefresh,
 }
 
 static CMDQ: Mutex<VecDeque<Cmd>> = Mutex::new(VecDeque::new());
@@ -1804,6 +1809,8 @@ static FULLSCREEN_WINDOWS: Mutex<Option<HashMap<isize, isize>>> = Mutex::new(Non
 // BARS_HOT short-circuits the whole check to one atomic load when idle.
 const MAX_BARS: usize = 8;
 static BARS_HOT: AtomicBool = AtomicBool::new(false);
+/// One-shot guard so an overflowing bar array reports itself exactly once.
+static BARHIT_FULL_LOGGED: AtomicBool = AtomicBool::new(false);
 static BARHIT_HWND: [AtomicIsize; MAX_BARS] = [const { AtomicIsize::new(0) }; MAX_BARS];
 static BARHIT_L: [AtomicI32; MAX_BARS] = [const { AtomicI32::new(0) }; MAX_BARS];
 static BARHIT_T: [AtomicI32; MAX_BARS] = [const { AtomicI32::new(0) }; MAX_BARS];
@@ -1816,7 +1823,15 @@ fn barhit_publish(hwnd: isize, r: Option<RECT>) {
     let slot = (0..MAX_BARS)
         .find(|&i| BARHIT_HWND[i].load(Ordering::Relaxed) == hwnd)
         .or_else(|| (0..MAX_BARS).find(|&i| BARHIT_HWND[i].load(Ordering::Relaxed) == 0));
-    let Some(i) = slot else { return };
+    let Some(i) = slot else {
+        // More than MAX_BARS monitors: this bar silently loses wheel routing.
+        // Rare, but it used to be invisible. Log it once — the fixed array has
+        // to stay (the hook reads it lock-free).
+        if !BARHIT_FULL_LOGGED.swap(true, Ordering::Relaxed) {
+            log_error!("more than {MAX_BARS} bars: wheel routing dropped for bar {hwnd:#x}");
+        }
+        return;
+    };
     match r {
         Some(r) => {
             BARHIT_L[i].store(r.left, Ordering::Relaxed);
@@ -2304,6 +2319,71 @@ impl Manager {
         }
         None
     }
+
+    /// Remove `h` from whichever workspace owns it. Returns where it was and
+    /// whether it was FLOATING there, and repairs that workspace's focus.
+    ///
+    /// This exists because the same three lines were open-coded at five call
+    /// sites, and two of them forgot `floating` — so `Alt+Shift+3` on a floating
+    /// window silently re-tiled it (review B-07). Membership changes go through
+    /// here or through `move_window`; nothing else touches `windows`/`floating`.
+    fn detach_window(&mut self, h: isize) -> Option<(usize, usize, bool)> {
+        let (mi, wi) = self.locate(h)?;
+        let ws = self.monitors.get_mut(mi)?.workspaces.get_mut(wi)?;
+        let was_floating = ws.floating.contains(&h);
+        ws.windows.retain(|&x| x != h);
+        ws.floating.retain(|&x| x != h);
+        if ws.focused == h {
+            ws.focused = ws.windows.first().copied().unwrap_or(0);
+        }
+        Some((mi, wi, was_floating))
+    }
+
+    /// Move `h` to (`to_mi`, `to_wi`), CARRYING its floating flag, and give it
+    /// that workspace's focus. `at` inserts before that tiled index (used when a
+    /// drag is dropped onto a specific window); `None` appends.
+    ///
+    /// Returns false when the window is untracked or the destination does not
+    /// exist — in which case nothing is changed, so a caller can never lose a
+    /// window by moving it somewhere invalid.
+    fn move_window(&mut self, h: isize, to_mi: usize, to_wi: usize, at: Option<usize>) -> bool {
+        if self
+            .monitors
+            .get(to_mi)
+            .and_then(|m| m.workspaces.get(to_wi))
+            .is_none()
+        {
+            return false;
+        }
+        let Some((_, _, was_floating)) = self.detach_window(h) else {
+            return false;
+        };
+        let ws = &mut self.monitors[to_mi].workspaces[to_wi];
+        match at.filter(|&i| i <= ws.windows.len()) {
+            Some(i) => ws.windows.insert(i, h),
+            None => ws.windows.push(h),
+        }
+        if was_floating {
+            ws.floating.push(h);
+        }
+        ws.focused = h;
+        true
+    }
+
+    /// The focused window of the focused monitor's active workspace (0 = none),
+    /// with its (monitor, workspace) — the `mi`/`a`/`focused` dance that was
+    /// repeated ~20 times.
+    fn focused(&self) -> (usize, usize, isize) {
+        let mi = self.focused_mon.min(self.monitors.len().saturating_sub(1));
+        let a = self.monitors.get(mi).map(|m| m.active).unwrap_or(0);
+        let h = self
+            .monitors
+            .get(mi)
+            .and_then(|m| m.workspaces.get(a))
+            .map(|ws| ws.focused)
+            .unwrap_or(0);
+        (mi, a, h)
+    }
 }
 
 /// Read a window's class name.
@@ -2735,6 +2815,14 @@ fn distribute_workspaces(
             let extra = m.workspaces.pop().unwrap();
             m.workspaces[0].windows.extend(extra.windows);
             m.workspaces[0].floating.extend(extra.floating);
+            // Carry the focus too when workspace 0 has none, or the folded
+            // windows arrive with focus pointing at whatever happened to be
+            // first (review B-14). `splits` is deliberately NOT carried: those
+            // ratios describe a different set of tiled windows and would place
+            // the merged set wrongly.
+            if m.workspaces[0].focused == 0 {
+                m.workspaces[0].focused = extra.focused;
+            }
         }
         if m.active >= m.workspaces.len() {
             m.active = 0;
@@ -3167,6 +3255,31 @@ fn ipc_worker() {
 /// Reveal + un-style a specific list of window handles. Takes the list by ref so
 /// callers control how they acquire it (the panic path must not re-lock a mutex
 /// it may already hold — see `restore_on_panic`).
+/// Undo Astur's per-window styling: full opacity, default border, and — the bit
+/// that used to be missed — REMOVE the `WS_EX_LAYERED` bit we added.
+///
+/// Setting alpha back to 255 is not enough. A layered window stays layered for
+/// the rest of its life, on a separate composition path, even after Astur exits
+/// (review B-16). `unfocused_opacity` defaults to 0.8, so this applied to every
+/// window Astur ever dimmed.
+unsafe fn unstyle_window(hwnd: HWND) {
+    if !IsWindow(hwnd).as_bool() {
+        return;
+    }
+    let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
+    let ex = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+    if ex & WS_EX_LAYERED.0 != 0 {
+        SetWindowLongW(hwnd, GWL_EXSTYLE, (ex & !WS_EX_LAYERED.0) as i32);
+    }
+    let def: u32 = 0xFFFFFFFF; // DWMWA_COLOR_DEFAULT
+    let _ = DwmSetWindowAttribute(
+        hwnd,
+        DWMWA_BORDER_COLOR,
+        &def as *const _ as *const c_void,
+        core::mem::size_of::<u32>() as u32,
+    );
+}
+
 unsafe fn restore_windows(list: &[isize]) {
     SUPPRESS.store(true, Ordering::Relaxed);
     for &h in list {
@@ -3176,15 +3289,8 @@ unsafe fn restore_windows(list: &[isize]) {
         }
         unmark_hidden_by_us(h);
         let _ = ShowWindow(hwnd, SW_SHOW);
-        // Undo any dimming and restore the default border. Positions untouched.
-        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
-        let def: u32 = 0xFFFFFFFF; // DWMWA_COLOR_DEFAULT
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_BORDER_COLOR,
-            &def as *const _ as *const c_void,
-            core::mem::size_of::<u32>() as u32,
-        );
+        // Undo dimming, the layered style and the border. Positions untouched.
+        unstyle_window(hwnd);
     }
     SUPPRESS.store(false, Ordering::Relaxed);
 }
@@ -3586,6 +3692,21 @@ unsafe fn focus_window(h: isize) {
     let fg = GetForegroundWindow();
     let cur = GetCurrentThreadId();
     let fgt = GetWindowThreadProcessId(fg, None);
+    // AttachThreadInput joins two threads' input queues and can block when the
+    // other thread is not pumping messages — with no timeout. This runs on the
+    // manager thread, which owns ALL window state, so one hung app would stall
+    // every workspace switch, hotkey and retile behind it (review B-12).
+    // Skipping the attach costs at worst a focus that does not take; blocking
+    // costs the whole WM.
+    if !fg.0.is_null() && IsHungAppWindow(fg).as_bool() {
+        log_error!(
+            "skipped focus attach: foreground window {:#x} is not responding",
+            fg.0 as isize
+        );
+        let _ = SetForegroundWindow(hwnd);
+        let _ = BringWindowToTop(hwnd);
+        return;
+    }
     if fgt != 0 && fgt != cur {
         let _ = AttachThreadInput(cur, fgt, BOOL(1));
         let _ = SetForegroundWindow(hwnd);
@@ -5052,15 +5173,7 @@ unsafe fn process(mgr: &mut Manager, cmd: Cmd) {
             for m in &mgr.monitors {
                 for ws in &m.workspaces {
                     for &h in &ws.windows {
-                        let hwnd = hwnd_from(h);
-                        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
-                        let def: u32 = 0xFFFFFFFF; // DWMWA_COLOR_DEFAULT
-                        let _ = DwmSetWindowAttribute(
-                            hwnd,
-                            DWMWA_BORDER_COLOR,
-                            &def as *const _ as *const c_void,
-                            core::mem::size_of::<u32>() as u32,
-                        );
+                        unstyle_window(hwnd_from(h));
                     }
                 }
             }
@@ -5198,14 +5311,11 @@ unsafe fn process(mgr: &mut Manager, cmd: Cmd) {
             if to_mi == from_mi && to_local == from_a {
                 return;
             }
-            {
-                let ws = &mut mgr.monitors[from_mi].workspaces[from_a];
-                ws.windows.retain(|&x| x != h);
-                ws.floating.retain(|&x| x != h);
-                ws.focused = ws.windows.first().copied().unwrap_or(0);
+            // Carries the floating flag: sending a floated window to another
+            // workspace used to silently re-tile it (review B-07).
+            if !mgr.move_window(h, to_mi, to_local, None) {
+                return;
             }
-            mgr.monitors[to_mi].workspaces[to_local].windows.push(h);
-            mgr.monitors[to_mi].workspaces[to_local].focused = h;
             retile_monitor(mgr, from_mi);
             // Follow the window: show its destination workspace, focus it, warp.
             mgr.focused_mon = to_mi;
@@ -5237,9 +5347,7 @@ unsafe fn process(mgr: &mut Manager, cmd: Cmd) {
             if !mgr.tiling {
                 return;
             }
-            let mi = mgr.focused_mon;
-            let a = mgr.monitors[mi].active;
-            let h = mgr.monitors[mi].workspaces[a].focused;
+            let (mi, a, h) = mgr.focused();
             if h == 0 {
                 return;
             }
@@ -5252,13 +5360,12 @@ unsafe fn process(mgr: &mut Manager, cmd: Cmd) {
             retile_monitor(mgr, mi);
         }
         Cmd::CloseFocused => {
-            let mi = mgr.focused_mon;
-            let a = mgr.monitors[mi].active;
-            let h = mgr.monitors[mi].workspaces[a].focused;
+            let (_, _, h) = mgr.focused();
             if h != 0 {
                 let _ = PostMessageW(hwnd_from(h), WM_CLOSE, WPARAM(0), LPARAM(0));
             }
         }
+        Cmd::BarRefresh => {} // the loop's update_bar does the work
         Cmd::Retile => retile_all(mgr),
         Cmd::RefreshMonitors => refresh_monitors(mgr),
         Cmd::DragUnmaximize(h, r) => {
@@ -5305,11 +5412,22 @@ unsafe fn process(mgr: &mut Manager, cmd: Cmd) {
             let Some((from_mi, from_wi)) = mgr.locate(h) else {
                 return;
             };
-            // Floating windows are left wherever the user dropped them.
+            // Floating windows keep the rect the user dropped them at — but if
+            // that was on ANOTHER monitor they must change owner, or switching
+            // workspaces on the old monitor SW_HIDEs a window the user is
+            // looking at on the new one (review B-06).
             if mgr.monitors[from_mi].workspaces[from_wi]
                 .floating
                 .contains(&h)
             {
+                let to_mi = monitor_index_for_point(mgr, POINT { x, y });
+                if to_mi != from_mi {
+                    let to_a = mgr.monitors[to_mi].active;
+                    if mgr.move_window(h, to_mi, to_a, None) {
+                        mgr.focused_mon = to_mi;
+                        log_debug!("floating window {h:#x} re-homed {from_mi} -> {to_mi}");
+                    }
+                }
                 return;
             }
             let from_a = mgr.monitors[from_mi].active;
@@ -5332,20 +5450,18 @@ unsafe fn process(mgr: &mut Manager, cmd: Cmd) {
                 mgr.monitors[from_mi].workspaces[from_a].focused = h;
                 retile_monitor(mgr, from_mi);
             } else {
-                // Move the window to the monitor it was dropped on.
-                {
-                    let ws = &mut mgr.monitors[from_mi].workspaces[from_a];
-                    ws.windows.retain(|&w| w != h);
-                    ws.floating.retain(|&w| w != h);
-                    ws.focused = ws.windows.first().copied().unwrap_or(0);
-                }
+                // Move the window to the monitor it was dropped on, landing it
+                // where it was dropped in the tiled order.
                 let to_a = mgr.monitors[to_mi].active;
-                let ws = &mut mgr.monitors[to_mi].workspaces[to_a];
-                match target.and_then(|t| ws.windows.iter().position(|&w| w == t)) {
-                    Some(pos) => ws.windows.insert(pos, h),
-                    None => ws.windows.push(h),
+                let at = target.and_then(|t| {
+                    mgr.monitors[to_mi].workspaces[to_a]
+                        .windows
+                        .iter()
+                        .position(|&w| w == t)
+                });
+                if !mgr.move_window(h, to_mi, to_a, at) {
+                    return;
                 }
-                ws.focused = h;
                 mgr.focused_mon = to_mi;
                 retile_monitor(mgr, from_mi);
                 retile_monitor(mgr, to_mi);
@@ -5479,9 +5595,7 @@ unsafe fn process(mgr: &mut Manager, cmd: Cmd) {
             if !mgr.tiling || mgr.monitors.is_empty() {
                 return;
             }
-            let mi = mgr.focused_mon;
-            let a = mgr.monitors[mi].active;
-            let h = mgr.monitors[mi].workspaces[a].focused;
+            let (mi, a, h) = mgr.focused();
             if h == 0 {
                 return;
             }
@@ -5507,15 +5621,10 @@ unsafe fn process(mgr: &mut Manager, cmd: Cmd) {
                 }
             } else if let Some(to_mi) = adjacent_monitor(mgr, mi, dir) {
                 // Move the window to the adjacent monitor's active workspace.
-                {
-                    let ws = &mut mgr.monitors[mi].workspaces[a];
-                    ws.windows.retain(|&w| w != h);
-                    ws.floating.retain(|&w| w != h);
-                    ws.focused = ws.windows.first().copied().unwrap_or(0);
-                }
                 let ta = mgr.monitors[to_mi].active;
-                mgr.monitors[to_mi].workspaces[ta].windows.push(h);
-                mgr.monitors[to_mi].workspaces[ta].focused = h;
+                if !mgr.move_window(h, to_mi, ta, None) {
+                    return;
+                }
                 mgr.focused_mon = to_mi;
                 retile_monitor(mgr, mi);
                 retile_monitor(mgr, to_mi);
@@ -7476,6 +7585,18 @@ unsafe extern "system" fn win_event_proc(
                 push_cmd(Cmd::Add(h));
             }
         }
+        EVENT_OBJECT_NAMECHANGE => {
+            // The bar's title widget used to freeze between manager commands:
+            // `update_bar` ran only after a Cmd, and the bar's own 1 s repaint
+            // draws from the cached snapshot (review B-08). Switching a browser
+            // tab or opening another file left a stale title on screen, which
+            // reads as "the bar is frozen".
+            // Only the foreground window's title is shown, so filter here and
+            // keep everything else off the queue.
+            if hwnd == GetForegroundWindow() {
+                push_cmd(Cmd::BarRefresh);
+            }
+        }
         EVENT_SYSTEM_FOREGROUND => {
             // Foreground events refire for the same window; collapse repeats so
             // the manager doesn't re-run locate + styling for no change.
@@ -7663,6 +7784,8 @@ const DEFAULT_LAUNCHER_SEL_RADIUS: i32 = 12; // rounded selection pill
 // config is read only by popup/menu threads through UI_CFG.
 static UI_CFG: Mutex<Option<Config>> = Mutex::new(None);
 static LAUNCHER_ENABLED: AtomicBool = AtomicBool::new(true);
+/// Window that had the foreground when the picker opened — the paste target.
+static LAUNCHER_PREV_FG: AtomicIsize = AtomicIsize::new(0);
 static SYSMENU_ENABLED: AtomicBool = AtomicBool::new(true);
 static ALT_TAB_REPLACE: AtomicBool = AtomicBool::new(false);
 static ALT_SWITCHER_MODE: AtomicBool = AtomicBool::new(false);
@@ -8033,8 +8156,27 @@ unsafe fn clipboard_capture(h: HWND) {
     items.truncate(cfg.clipboard_limit);
 }
 
+/// Type text into whatever the user was working in. Restores foreground to the
+/// window that had it when the picker opened and WAITS for it, because Ctrl+V
+/// goes wherever the foreground is at the moment it is injected.
 unsafe fn paste_text(h: HWND, text: &str) {
     clipboard_set_text(h, text);
+    let target = LAUNCHER_PREV_FG.swap(0, Ordering::Relaxed);
+    if target != 0 && IsWindow(hwnd_from(target)).as_bool() {
+        focus_window(target);
+        // Up to ~100 ms; foreground changes are asynchronous and the window
+        // may have to repaint first. Bounded so a stuck app cannot hang the
+        // launcher thread.
+        for _ in 0..20 {
+            if GetForegroundWindow().0 as isize == target {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        if GetForegroundWindow().0 as isize != target {
+            log_error!("paste target {target:#x} never regained focus; pasting anyway");
+        }
+    }
     inject_key(VK_CONTROL, false);
     inject_key(VIRTUAL_KEY(0x56), false);
     inject_key(VIRTUAL_KEY(0x56), true);
@@ -10275,6 +10417,11 @@ unsafe extern "system" fn launcher_wndproc(h: HWND, msg: u32, w: WPARAM, l: LPAR
         WM_LAUNCHER => {
             match w.0 {
                 LA_OPEN => {
+                    // Remember what had focus. The picker is NOACTIVATE, but
+                    // hiding it does not synchronously hand foreground back, so
+                    // a paste fired straight after the hide raced focus
+                    // restoration and could land in the wrong window (B-13).
+                    LAUNCHER_PREV_FG.store(GetForegroundWindow().0 as isize, Ordering::Relaxed);
                     {
                         let mut st = LAUNCHER_STATE.lock().unwrap();
                         if !st.loaded {
@@ -12325,6 +12472,20 @@ fn main() {
             0,
             WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
         );
+        // Title changes, so the bar's title widget tracks browser tabs, editor
+        // files and download progress instead of freezing between commands.
+        // The callback filters to the foreground window (OBJID_WINDOW only —
+        // the proc already drops every id_object != 0), so this noisy event
+        // costs one comparison per fire.
+        let _ = SetWinEventHook(
+            EVENT_OBJECT_NAMECHANGE,
+            EVENT_OBJECT_NAMECHANGE,
+            None,
+            Some(win_event_proc),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+        );
 
         // System tray icon — the control surface for Astur Full (no console in
         // release): left/double-click opens Settings, right-click menu = Settings/Quit.
@@ -12417,6 +12578,188 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- workspace model --------------------------------------------------
+    // `Manager` owns window membership. These tests exercise it directly (no
+    // Win32, no real windows), which is the whole point of routing every
+    // membership change through `move_window`/`detach_window`: the bug class
+    // they replaced — a window dropped from `floating`, or left owned by the
+    // monitor it is no longer on — is now checkable in CI.
+
+    fn test_manager(monitors: usize, workspaces: usize) -> Manager {
+        let mons = (0..monitors)
+            .map(|i| {
+                Monitor::new(
+                    0x1000 + i as isize,
+                    RECT {
+                        left: i as i32 * 1920,
+                        top: 0,
+                        right: (i as i32 + 1) * 1920,
+                        bottom: 1080,
+                    },
+                    workspaces,
+                )
+            })
+            .collect();
+        // INDEX is a global mirror of membership; tests must not inherit a
+        // previous test's snapshot, and `locate` falls back to a linear scan.
+        *INDEX.lock().unwrap() = None;
+        Manager {
+            monitors: mons,
+            focused_mon: 0,
+            primary: 0,
+            tiling: true,
+            cfg: Config::defaults(),
+            pending_launch_mon: 0,
+        }
+    }
+
+    /// Every tracked window appears exactly once across every workspace, and
+    /// `floating` is always a subset of `windows`.
+    fn assert_model_sound(mgr: &Manager, expect: &[isize]) {
+        let mut seen: Vec<isize> = Vec::new();
+        for m in &mgr.monitors {
+            for ws in &m.workspaces {
+                for &h in &ws.windows {
+                    assert!(!seen.contains(&h), "window {h:#x} is in two workspaces");
+                    seen.push(h);
+                }
+                for &f in &ws.floating {
+                    assert!(
+                        ws.windows.contains(&f),
+                        "floating {f:#x} is not in its workspace's windows"
+                    );
+                }
+                assert!(
+                    ws.focused == 0 || ws.windows.contains(&ws.focused),
+                    "workspace focus {:#x} is not one of its own windows",
+                    ws.focused
+                );
+            }
+        }
+        seen.sort_unstable();
+        let mut want = expect.to_vec();
+        want.sort_unstable();
+        assert_eq!(seen, want, "windows were lost or duplicated");
+    }
+
+    fn add(mgr: &mut Manager, mi: usize, wi: usize, h: isize, floating: bool) {
+        let ws = &mut mgr.monitors[mi].workspaces[wi];
+        ws.windows.push(h);
+        if floating {
+            ws.floating.push(h);
+        }
+        ws.focused = h;
+    }
+
+    #[test]
+    fn move_window_carries_the_floating_flag() {
+        // B-07: Alt+Shift+<n> on a floated window silently re-tiled it.
+        let mut mgr = test_manager(1, 3);
+        add(&mut mgr, 0, 0, 0xA, true);
+        assert!(mgr.move_window(0xA, 0, 2, None));
+        assert!(mgr.monitors[0].workspaces[2].floating.contains(&0xA));
+        assert!(mgr.monitors[0].workspaces[0].floating.is_empty());
+        assert_model_sound(&mgr, &[0xA]);
+    }
+
+    #[test]
+    fn move_window_across_monitors_changes_owner() {
+        // B-06: the window stayed owned by the monitor it had left, so
+        // switching workspaces there hid a window visible on the other screen.
+        let mut mgr = test_manager(2, 2);
+        add(&mut mgr, 0, 0, 0xA, true);
+        add(&mut mgr, 0, 0, 0xB, false);
+        assert!(mgr.move_window(0xA, 1, 0, None));
+        assert_eq!(mgr.locate(0xA), Some((1, 0)));
+        assert!(mgr.monitors[1].workspaces[0].floating.contains(&0xA));
+        // The source workspace repaired its own focus rather than pointing at a
+        // window it no longer owns.
+        assert_eq!(mgr.monitors[0].workspaces[0].focused, 0xB);
+        assert_model_sound(&mgr, &[0xA, 0xB]);
+    }
+
+    #[test]
+    fn move_window_to_a_missing_destination_changes_nothing() {
+        let mut mgr = test_manager(1, 2);
+        add(&mut mgr, 0, 0, 0xA, false);
+        assert!(!mgr.move_window(0xA, 5, 0, None), "bogus monitor");
+        assert!(!mgr.move_window(0xA, 0, 9, None), "bogus workspace");
+        assert_eq!(mgr.locate(0xA), Some((0, 0)));
+        assert_model_sound(&mgr, &[0xA]);
+    }
+
+    #[test]
+    fn move_window_honours_the_drop_position() {
+        let mut mgr = test_manager(2, 1);
+        add(&mut mgr, 1, 0, 0xB, false);
+        add(&mut mgr, 1, 0, 0xC, false);
+        add(&mut mgr, 0, 0, 0xA, false);
+        assert!(mgr.move_window(0xA, 1, 0, Some(1)));
+        assert_eq!(mgr.monitors[1].workspaces[0].windows, vec![0xB, 0xA, 0xC]);
+        assert_model_sound(&mgr, &[0xA, 0xB, 0xC]);
+    }
+
+    #[test]
+    fn a_window_is_never_lost_by_any_sequence_of_moves() {
+        let mut mgr = test_manager(3, 4);
+        let all: Vec<isize> = (1..=9).collect();
+        for (i, &h) in all.iter().enumerate() {
+            add(&mut mgr, i % 3, i % 4, h, i % 2 == 0);
+        }
+        assert_model_sound(&mgr, &all);
+        // Deterministic shuffle: every window visits every monitor/workspace.
+        for round in 0..7usize {
+            for (i, &h) in all.iter().enumerate() {
+                let to_mi = (i + round) % 3;
+                let to_wi = (i * 2 + round) % 4;
+                assert!(mgr.move_window(h, to_mi, to_wi, None));
+                assert_model_sound(&mgr, &all);
+            }
+        }
+    }
+
+    #[test]
+    fn detach_repairs_focus_and_reports_floating() {
+        let mut mgr = test_manager(1, 1);
+        add(&mut mgr, 0, 0, 0xA, false);
+        add(&mut mgr, 0, 0, 0xB, true);
+        assert_eq!(mgr.detach_window(0xB), Some((0, 0, true)));
+        assert_eq!(mgr.monitors[0].workspaces[0].focused, 0xA);
+        assert_eq!(mgr.detach_window(0xB), None, "already gone");
+        assert_model_sound(&mgr, &[0xA]);
+    }
+
+    #[test]
+    fn focused_never_indexes_out_of_range() {
+        let mut mgr = test_manager(1, 1);
+        add(&mut mgr, 0, 0, 0xA, false);
+        // A stale focused_mon (monitor unplugged mid-command) must not panic —
+        // `panic = "abort"` would take the WM down and strand hidden windows.
+        mgr.focused_mon = 7;
+        let (mi, _, _) = mgr.focused();
+        assert_eq!(mi, 0);
+        mgr.monitors.clear();
+        assert_eq!(mgr.focused(), (0, 0, 0));
+    }
+
+    #[test]
+    fn shrinking_the_workspace_count_keeps_windows_and_focus() {
+        // B-14: the folded workspace's `focused` was dropped on the floor.
+        let mut mgr = test_manager(1, 3);
+        add(&mut mgr, 0, 2, 0xA, false);
+        add(&mut mgr, 0, 2, 0xB, true);
+        mgr.monitors[0].workspaces[2].focused = 0xB;
+        distribute_workspaces(&mut mgr.monitors, 0, 1, true);
+        assert_eq!(mgr.monitors[0].workspaces.len(), 1);
+        assert_eq!(mgr.locate(0xA), Some((0, 0)));
+        assert!(
+            mgr.monitors[0].workspaces[0].floating.contains(&0xB),
+            "folding a workspace must not re-tile its floating windows"
+        );
+        assert_eq!(mgr.monitors[0].workspaces[0].focused, 0xB);
+        assert_model_sound(&mgr, &[0xA, 0xB]);
+    }
 
     #[test]
     fn monitor_cover_requires_all_four_edges() {

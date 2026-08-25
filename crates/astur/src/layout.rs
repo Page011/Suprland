@@ -23,20 +23,30 @@ pub(crate) fn master_stack(area: RECT, n: usize, ratio: f32, outer: i32, inner: 
         });
         return out;
     }
-    let master_w = ((w - inner) as f32 * ratio) as i32;
-    let stack_w = (w - inner) - master_w;
+    // Clamp the gaps to what actually fits. `inner_gap` accepts up to 500 in the
+    // config, and on a small work area with many stacked windows the unclamped
+    // arithmetic produced rects with bottom < top — SetWindowPos then does
+    // something arbitrary (review B-11). `grid_cells` has always guarded this
+    // with `fitted_gap`; master and dwindle did not.
+    let col_gap = fitted_gap(w, 2, inner);
+    let master_w = ((w - col_gap) as f32 * ratio) as i32;
+    let stack_w = (w - col_gap) - master_w;
     out.push(RECT {
         left: x0,
         top: y0,
         right: x0 + master_w,
         bottom: y0 + h,
     });
-    let sx = x0 + master_w + inner;
+    let sx = x0 + master_w + col_gap;
     let sc = (n - 1) as i32;
-    let each = (h - (sc - 1) * inner) / sc;
+    let row_gap = fitted_gap(h, n - 1, inner);
+    let each = ((h - (sc - 1) * row_gap) / sc).max(1);
     for i in 0..sc {
-        let sy = y0 + i * (each + inner);
+        let sy = y0 + i * (each + row_gap);
         let bottom = if i == sc - 1 { y0 + h } else { sy + each };
+        if bottom <= sy || sx + stack_w <= sx {
+            break; // out of room; better to leave a window put than invert it
+        }
         out.push(RECT {
             left: sx,
             top: sy,
@@ -83,29 +93,71 @@ pub(crate) fn dwindle_layout(
         }
         let w = cur.right - cur.left;
         let h = cur.bottom - cur.top;
+        // No room for another split: give every remaining window the rect we
+        // have. Dropping them would leave real windows wherever they happened
+        // to be, which is worse than a stack.
+        if w.max(h) < MIN_TILE * 2 {
+            for _ in i..n {
+                out.push(cur);
+            }
+            break;
+        }
         let r = split_ratio(splits, i);
         if w >= h {
-            let half = ((w - inner) as f32 * r) as i32;
+            // See the note in master_stack: an unclamped gap wider than the
+            // remaining space made `half` negative and inverted the rect.
+            let gap = fitted_gap(w, 2, inner);
+            let half = (((w - gap) as f32 * r) as i32).max(1);
             out.push(RECT {
                 left: cur.left,
                 top: cur.top,
                 right: cur.left + half,
                 bottom: cur.bottom,
             });
-            cur.left += half + inner;
+            cur.left += half + gap;
         } else {
-            let half = ((h - inner) as f32 * r) as i32;
+            let gap = fitted_gap(h, 2, inner);
+            let half = (((h - gap) as f32 * r) as i32).max(1);
             out.push(RECT {
                 left: cur.left,
                 top: cur.top,
                 right: cur.right,
                 bottom: cur.top + half,
             });
-            cur.top += half + inner;
+            cur.top += half + gap;
+        }
+        if cur.right <= cur.left || cur.bottom <= cur.top {
+            // Belt and braces: never emit an inverted rect, whatever the gaps.
+            for _ in i + 1..n {
+                out.push(*out.last().expect("pushed above"));
+            }
+            break;
         }
     }
     out
 }
+
+/// True while `dwindle_layout` can still give every window its own tile. Above
+/// this count the tail stacks (see `MIN_TILE`).
+#[cfg(test)]
+fn dwindle_tiles_fit(area: RECT, n: usize, outer: i32, inner: i32, splits: &[f32]) -> bool {
+    let rects = dwindle_layout(area, n, outer, inner, splits);
+    rects.len() == n && rects.windows(2).all(|p| p[0] != p[1])
+}
+
+/// Smallest tile a dwindle split may produce (roughly a title bar). Below this
+/// the spiral stops dividing and the remaining windows share the last rect
+/// (monocle-style tail) — every window still gets a real, on-screen rect, which
+/// is what matters. Splitting past this point produced 1-px slivers, and before
+/// the gaps were clamped it produced INVERTED rects that went straight to
+/// SetWindowPos (review B-11).
+///
+/// Measured, not guessed: because the spiral halves geometrically, the value
+/// barely moves the practical limit on a 1920x1052 work area with outer 8 /
+/// inner 4 — 60 px gives 9 distinct tiles, 32 gives 10, and 16 still gives only
+/// 12. Past ~10 windows dwindle is unusable whatever we do, so 32 is chosen for
+/// staying closest to the old behaviour at realistic counts.
+const MIN_TILE: i32 = 32;
 
 /// Equal-width columns. Useful for ultrawide monitors and predictable placement.
 pub(crate) fn columns_layout(area: RECT, n: usize, outer: i32, inner: i32) -> Vec<RECT> {
@@ -221,22 +273,27 @@ pub(crate) fn resize_dwindle(
         right: area.right - outer,
         bottom: area.bottom - outer,
     };
+    // Must replay EXACTLY what dwindle_layout does, gap clamping included, or a
+    // drag maps onto the wrong split level.
     for i in 0..level {
         let w = cur.right - cur.left;
         let h = cur.bottom - cur.top;
         let r = split_ratio(splits, i);
         if w >= h {
-            let half = ((w - inner) as f32 * r) as i32;
-            cur.left += half + inner;
+            let gap = fitted_gap(w, 2, inner);
+            let half = (((w - gap) as f32 * r) as i32).max(1);
+            cur.left += half + gap;
         } else {
-            let half = ((h - inner) as f32 * r) as i32;
-            cur.top += half + inner;
+            let gap = fitted_gap(h, 2, inner);
+            let half = (((h - gap) as f32 * r) as i32).max(1);
+            cur.top += half + gap;
         }
     }
     let w = cur.right - cur.left;
     let h = cur.bottom - cur.top;
     let vertical = w >= h;
-    let avail = (if vertical { w } else { h } - inner).max(1) as f32;
+    let gap = fitted_gap(if vertical { w } else { h }, 2, inner);
+    let avail = (if vertical { w } else { h } - gap).max(1) as f32;
     let new_size = if vertical {
         new.right - new.left
     } else {
@@ -376,6 +433,145 @@ mod tests {
         // The last window is the remainder of level 0: width 120 -> ratio 1-0.6.
         resize_dwindle(&mut splits, area, 2, 0, 0, 1, r(80, 0, 200, 100));
         assert!((splits[0] - 0.4).abs() < 1e-3, "got {}", splits[0]);
+    }
+
+    // ---- invariants -------------------------------------------------------
+    // The bug these exist for: `master_stack` with many stack windows and a
+    // large `inner_gap` (the config allows up to 500) produced rects with
+    // `bottom < top`, and `workspace_layout` fed them straight to SetWindowPos
+    // without checking (review B-11). Pure functions, so this sweep is free.
+
+    /// Partial overlap = bug. Two IDENTICAL rects are a deliberate stack
+    /// (monocle, and dwindle's tail once there is no room left to split).
+    fn overlaps(a: RECT, b: RECT) -> bool {
+        a != b && a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom
+    }
+
+    /// Every rect is non-degenerate, inside the work area, and never partially
+    /// on top of another.
+    fn assert_sane(name: &str, area: RECT, rects: &[RECT], disjoint: bool) {
+        for (i, c) in rects.iter().enumerate() {
+            assert!(
+                c.right > c.left && c.bottom > c.top,
+                "{name}: rect {i} is inverted/empty: {:?}",
+                (c.left, c.top, c.right, c.bottom)
+            );
+            assert!(
+                c.left >= area.left
+                    && c.top >= area.top
+                    && c.right <= area.right
+                    && c.bottom <= area.bottom,
+                "{name}: rect {i} escapes the work area: {:?}",
+                (c.left, c.top, c.right, c.bottom)
+            );
+        }
+        if disjoint {
+            for i in 0..rects.len() {
+                for j in i + 1..rects.len() {
+                    assert!(
+                        !overlaps(rects[i], rects[j]),
+                        "{name}: rects {i} and {j} overlap: {:?} {:?}",
+                        (rects[i].left, rects[i].top, rects[i].right, rects[i].bottom),
+                        (rects[j].left, rects[j].top, rects[j].right, rects[j].bottom)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_layout_stays_sane_across_counts_and_gaps() {
+        // Small areas included on purpose: that is where the gap arithmetic
+        // used to go negative.
+        let areas = [
+            r(0, 0, 1920, 1080),
+            r(-1920, 0, 0, 1080), // monitor left of the primary (negative x)
+            r(0, 28, 1280, 800),  // bar reserved
+            r(0, 0, 320, 240),    // tiny
+        ];
+        for area in areas {
+            for n in 1..=20usize {
+                for outer in [0, 8, 40] {
+                    for inner in [0, 4, 60, 200] {
+                        let splits: Vec<f32> = vec![0.5; n];
+                        let tag = format!("n={n} outer={outer} inner={inner}");
+                        assert_sane(
+                            &format!("master {tag}"),
+                            area,
+                            &master_stack(area, n, 0.55, outer, inner),
+                            true,
+                        );
+                        assert_sane(
+                            &format!("dwindle {tag}"),
+                            area,
+                            &dwindle_layout(area, n, outer, inner, &splits),
+                            true,
+                        );
+                        assert_sane(
+                            &format!("columns {tag}"),
+                            area,
+                            &columns_layout(area, n, outer, inner),
+                            true,
+                        );
+                        assert_sane(
+                            &format!("grid {tag}"),
+                            area,
+                            &grid_layout(area, n, outer, inner),
+                            true,
+                        );
+                        // Monocle deliberately returns n copies of one rect.
+                        assert_sane(
+                            &format!("monocle {tag}"),
+                            area,
+                            &monocle_layout(area, n, outer),
+                            false,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn layouts_actually_place_every_window_on_a_normal_desktop() {
+        // Guards the sweep above from passing vacuously: `assert_sane` is
+        // trivially true for an empty result, so pin the ordinary case.
+        let area = r(0, 28, 1920, 1080);
+        for n in 1..=20usize {
+            let splits = vec![0.5; n];
+            assert_eq!(master_stack(area, n, 0.55, 8, 4).len(), n, "master n={n}");
+            assert_eq!(
+                dwindle_layout(area, n, 8, 4, &splits).len(),
+                n,
+                "dwindle n={n}"
+            );
+            // The spiral halves each time, so it runs out of room before the
+            // other layouts do; past that the tail stacks rather than being
+            // dropped or inverted. 14 is where that starts on a 1920x1052 work
+            // area with these gaps — a number, not an adjective.
+            assert_eq!(
+                dwindle_tiles_fit(area, n, 8, 4, &splits),
+                n <= 10,
+                "dwindle distinct-tile limit moved at n={n}"
+            );
+            assert_eq!(columns_layout(area, n, 8, 4).len(), n, "columns n={n}");
+            assert_eq!(grid_layout(area, n, 8, 4).len(), n, "grid n={n}");
+            assert_eq!(monocle_layout(area, n, 8).len(), n, "monocle n={n}");
+        }
+    }
+
+    #[test]
+    fn master_stack_survives_an_absurd_gap() {
+        // Was: `each` went <= 0 and every stack rect came out with bottom < top.
+        let v = master_stack(r(0, 0, 800, 600), 12, 0.5, 0, 500);
+        assert!(v.iter().all(|c| c.right > c.left && c.bottom > c.top));
+    }
+
+    #[test]
+    fn dwindle_survives_an_absurd_gap() {
+        let splits = vec![0.5; 12];
+        let v = dwindle_layout(r(0, 0, 800, 600), 12, 0, 500, &splits);
+        assert!(v.iter().all(|c| c.right > c.left && c.bottom > c.top));
     }
 
     #[test]

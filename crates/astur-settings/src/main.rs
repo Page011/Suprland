@@ -322,6 +322,7 @@ impl App {
             ("ipc_enabled", b(c.ipc_enabled)),
             ("ipc_pipe", c.ipc_pipe.clone()),
             ("persist_state", b(c.persist_state)),
+            ("log_level", c.log_level.clone()),
             ("extra_hotkeys", format_hotkeys(&c.extra_hotkeys)),
             ("key_focus_next", vk_to_key(c.key_focus_next)),
             ("key_focus_prev", vk_to_key(c.key_focus_prev)),
@@ -916,6 +917,17 @@ impl App {
         ui.checkbox(
             &mut self.cfg.persist_state,
             "Persist active workspace indexes and launcher MRU",
+        );
+
+        heading(ui, "Diagnostics");
+        ui.horizontal(|ui| {
+            ui.label("Log level");
+            for level in ["off", "error", "info", "debug"] {
+                ui.selectable_value(&mut self.cfg.log_level, level.to_string(), level);
+            }
+        });
+        ui.label(
+            r"Astur has no console. This writes %USERPROFILE%\.astur\astur.log (rotates at 1 MB). Run astur.exe --check for a paste-ready report.",
         );
 
         heading(ui, "Local command API");

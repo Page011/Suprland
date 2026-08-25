@@ -122,6 +122,9 @@ pub struct Config {
     pub ipc_enabled: bool,
     pub ipc_pipe: String,
     pub persist_state: bool,
+    /// Diagnostics verbosity: off | error | info | debug. Astur ships without a
+    /// console, so this file log is the only way a user can report what broke.
+    pub log_level: String,
     pub extra_hotkeys: Vec<HotkeyDef>,
     pub window_rules: Vec<WindowRule>,
     pub bar_enabled: bool,         // draw the status bar on every monitor
@@ -321,6 +324,7 @@ impl Config {
             ipc_enabled: false,
             ipc_pipe: "astur".to_string(),
             persist_state: true,
+            log_level: "error".to_string(),
             extra_hotkeys: vec![HotkeyDef {
                 chord: "ALT+GRAVE".to_string(),
                 action: "scratchpad".to_string(),
@@ -414,6 +418,14 @@ const DEFAULT_CONFIG: &str = "\
 # Syntax   : one  key = value  per line. '#' starts a comment. Blank lines and
 #            surrounding whitespace are ignored. Unknown keys are ignored, so a
 #            typo silently falls back to the default below rather than erroring.
+#            Set log_level = info to have unknown keys reported in astur.log.
+#
+# Pixels   : every size here is a LOGICAL pixel, i.e. what it measures on a
+#            100%-scale display. Astur is per-monitor-DPI aware, so a bar height
+#            of 28 draws as 28 px at 100%, 35 px at 125% and 42 px at 150%, and
+#            two monitors at different scales each get the right physical size.
+#            (Before 2.1.3 the whole process was DPI-unaware; these numbers were
+#            stretched by Windows instead, which also broke tiling — issue #5.)
 #
 # Value types:
 #   bool   : true / false   (also accepts yes/no, 1/0, on/off; anything else
@@ -550,7 +562,7 @@ theme = dark
 # look). Uses an undocumented Windows API; if popups render oddly, turn it off.
 # bool
 acrylic = false
-# Popup typography and geometry. Sizes are pixels in current process DPI mode.
+# Popup typography and geometry. See the pixel note at the top of this file.
 popup_font_name = Segoe UI
 popup_font_size = 18
 popup_font_weight = 400
@@ -657,6 +669,13 @@ wallpaper_dir =
 workspace_wallpapers =
 media_enabled = false
 persist_state = true
+# Diagnostics log at %USERPROFILE%\\.astur\\astur.log (rotates at 1 MB).
+#   off   = write nothing
+#   error = failures only (default)
+#   info  = + startup environment, monitors/DPI, hook re-arms, config reloads
+#   debug = + per-command detail. Verbose; for reproducing a bug.
+# Run `astur.exe --check` for a paste-ready diagnostics dump.
+log_level = error
 # Local named-pipe command API. Pipe name only; no remote/network listener.
 ipc_enabled = false
 ipc_pipe = astur
@@ -714,6 +733,10 @@ const DEFAULT_NAVBAR: &str = "\
 # bar. Click a workspace pill to switch to it.
 #
 # Value types: bool, int, colour (#RRGGBB) -- see astur.conf for details.
+#
+# Pixels: every size here is a LOGICAL pixel (what it measures at 100% scale).
+# Astur scales the bar per monitor, so height = 28 draws 28 px at 100% and
+# 42 px at 150%, correctly on each screen of a mixed-scale setup.
 # ============================================================================
 
 # Show the bars.  bool   (set false to disable entirely)
@@ -1414,6 +1437,11 @@ fn parse_into(c: &mut Config, text: &str) {
                 }
             }
             "persist_state" => c.persist_state = parse_bool(v),
+            "log_level" => {
+                if matches!(v, "off" | "error" | "info" | "debug") {
+                    c.log_level = v.to_string()
+                }
+            }
             "extra_hotkeys" => c.extra_hotkeys = parse_hotkeys(v),
             "window_rules" => c.window_rules = parse_window_rules(v),
             "ignore_classes" => c.ignore_classes = parse_list(v),

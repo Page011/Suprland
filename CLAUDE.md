@@ -51,13 +51,18 @@ pre-workspace); the workspace below is the evolving full "Astur" (v2). See
 `plan/roadmap-v2.md`.
 
 - `crates/astur/src/main.rs` — everything Win32: hooks, manager loop, compositors,
-  bar, launcher, system menu, file search. One big translation unit by design (fast
-  build, no module ceremony). The binary users run.
+  bar, launcher, system menu, file search. The binary users run. It is one file
+  because we prefer it that way, not for build speed: splitting a crate into
+  modules does not change Rust build time (the crate is still one compilation
+  unit, and `codegen-units = 1` in release makes that literal). If it ever gets
+  split, say so honestly — don't reuse the old rationale.
 - `crates/astur/src/layout.rs` — pure geometry (`dwindle_layout`, `master_stack`).
   Uses the `RECT` type only; no Win32 calls.
 - `crates/astur-config/src/lib.rs` — pure parsing → `Config`. **No Win32.** Shared by
-  the WM and the (WIP) settings GUI so they never drift; aliased as `config` in the WM.
-- `crates/astur-settings/` — the settings GUI (egui, WIP — stub for now).
+  the WM and the settings GUI so they never drift; aliased as `config` in the WM.
+- `crates/astur-settings/` — the settings GUI (egui). Shipped, ~1.2k lines, 14
+  sections; the installer bundles it and the tray launches it. It parses config
+  through `astur-config` so it cannot drift from the WM.
 
 NOTE: plan/ docs written before the workspace say `src/main.rs` / `src/config.rs` —
 those now map to `crates/astur/src/main.rs` / `crates/astur-config/src/lib.rs`.

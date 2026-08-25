@@ -1,0 +1,53 @@
+name: CI
+
+# Gate on every push and PR, not only on tags. Before this existed the 21+ tests
+# in the workspace never ran outside a developer's shell, and a broken `main` was
+# discovered at release time.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  check:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # Keyed on the lockfile; the windows crate is the expensive part of a cold
+      # build and it moves rarely.
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      # Catches anything that only fails under LTO / codegen-units=1 /
+      # panic=abort, which is what users actually run.
+      - name: Build release
+        run: cargo build --release --workspace

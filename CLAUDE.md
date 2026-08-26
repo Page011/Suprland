@@ -60,7 +60,7 @@ pre-workspace); the workspace below is the evolving full "Astur" (v2). See
   Uses the `RECT` type only; no Win32 calls.
 - `crates/astur-config/src/lib.rs` — pure parsing → `Config`. **No Win32.** Shared by
   the WM and the settings GUI so they never drift; aliased as `config` in the WM.
-- `crates/astur-settings/` — the settings GUI (egui). Shipped, ~1.2k lines, 14
+- `crates/astur-settings/` — the settings GUI (egui). Shipped, ~1.2k lines, 13
   sections; the installer bundles it and the tray launches it. It parses config
   through `astur-config` so it cannot drift from the WM.
 

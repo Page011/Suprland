@@ -46,6 +46,7 @@ features = [
     "Win32_System_Search",
     "Win32_System_Shutdown",
     "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_System_Registry",
     "Win32_Media_Audio",
     "Win32_Media_Audio_Endpoints",

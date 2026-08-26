@@ -37,8 +37,8 @@ use layout::{
 use windows::core::{w, PCWSTR};
 use windows::core::{IUnknown, Interface, GUID};
 use windows::Win32::Foundation::{
-    CloseHandle, BOOL, BOOLEAN, COLORREF, HANDLE, HINSTANCE, HWND, INVALID_HANDLE_VALUE, LPARAM,
-    LRESULT, LUID, POINT, RECT, SIZE, SYSTEMTIME, WPARAM,
+    CloseHandle, LocalFree, BOOL, BOOLEAN, COLORREF, HANDLE, HINSTANCE, HLOCAL, HWND,
+    INVALID_HANDLE_VALUE, LPARAM, LRESULT, LUID, POINT, RECT, SIZE, SYSTEMTIME, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
     AlphaBlend, BeginPaint, BitBlt, CombineRgn, CreateBitmap, CreateCompatibleBitmap,
@@ -57,9 +57,13 @@ use windows::Win32::Media::Audio::{
     eConsole, eRender, Endpoints::IAudioEndpointVolume, IMMDeviceEnumerator, MMDeviceEnumerator,
 };
 use windows::Win32::NetworkManagement::IpHelper::{FreeMibTable, GetIfTable2, MIB_IF_TABLE2};
+use windows::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+};
 use windows::Win32::Security::{
-    AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED,
-    SE_SHUTDOWN_NAME, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    AdjustTokenPrivileges, GetTokenInformation, LookupPrivilegeValueW, TokenUser,
+    LUID_AND_ATTRIBUTES, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, SE_PRIVILEGE_ENABLED,
+    SE_SHUTDOWN_NAME, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER,
 };
 use windows::Win32::Storage::FileSystem::{
     ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, FILE_FLAGS_AND_ATTRIBUTES, PIPE_ACCESS_DUPLEX,
@@ -73,7 +77,7 @@ use windows::Win32::System::Console::{
 };
 use windows::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
-    IsClipboardFormatAvailable, OpenClipboard, SetClipboardData,
+    IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
 };
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
@@ -163,10 +167,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART,
     EVENT_SYSTEM_MOVESIZEEND, GWLP_USERDATA, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, MB_ICONERROR, MB_OK,
     PM_REMOVE, PW_RENDERFULLCONTENT, SMTO_ABORTIFHUNG, SM_CXSCREEN, SM_CYSCREEN, SPIF_SENDCHANGE,
-    SPIF_UPDATEINIFILE, SPI_GETWORKAREA, SPI_SETDESKWALLPAPER, SPI_SETFOREGROUNDLOCKTIMEOUT,
-    SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
-    WM_CLIPBOARDUPDATE, WM_CLOSE, WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND,
-    WM_PAINT, WM_QUERYENDSESSION, WM_TIMER, WM_USER, WS_CHILD,
+    SPIF_UPDATEINIFILE, SPI_GETFOREGROUNDLOCKTIMEOUT, SPI_GETWORKAREA, SPI_SETDESKWALLPAPER,
+    SPI_SETFOREGROUNDLOCKTIMEOUT, SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_CLIPBOARDUPDATE, WM_CLOSE, WM_DISPLAYCHANGE,
+    WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND, WM_PAINT, WM_QUERYENDSESSION, WM_TIMER, WM_USER,
+    WS_CHILD,
 };
 
 // =========================================================================
@@ -1738,6 +1743,11 @@ fn apply_hook_config(cfg: &Config) {
     // Every startup and every reload comes through here, so this is the one
     // place the log level has to be applied.
     LOG_LEVEL.store(log_level_from_str(&cfg.log_level), Ordering::Relaxed);
+    // Logged at ERROR — the default level — because a key Astur did not
+    // understand is a setting the user believes is in effect and is not.
+    for key in &cfg.unknown_keys {
+        log_error!("config line not understood (ignored): {key}");
+    }
     FOLLOW_MOUSE.store(cfg.focus_follows_mouse, Ordering::Relaxed);
     *IGNORE_CLASSES.lock().unwrap() = cfg.ignore_classes.clone();
     *FLOAT_CLASSES.lock().unwrap() = cfg.float_classes.clone();
@@ -3138,6 +3148,69 @@ fn mru_worker() {
         let _ = std::fs::write(path, text);
     }
 }
+/// A security descriptor granting full access to the current user's SID and
+/// nobody else, for the IPC pipe. Leaked deliberately: it lives for the process
+/// lifetime and is handed to CreateNamedPipeW on every accept loop iteration.
+/// Returns None if anything fails, in which case the caller falls back to the
+/// default DACL (which is what shipped before).
+unsafe fn owner_only_security_descriptor() -> Option<*mut c_void> {
+    static SD: OnceLock<usize> = OnceLock::new();
+    let value = *SD.get_or_init(|| {
+        // Own SID, as a string, straight from the process token.
+        let mut token = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return 0;
+        }
+        let mut len = 0u32;
+        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut len);
+        let mut buf = vec![0u8; len as usize];
+        let ok = len > 0
+            && GetTokenInformation(
+                token,
+                TokenUser,
+                Some(buf.as_mut_ptr() as *mut c_void),
+                len,
+                &mut len,
+            )
+            .is_ok();
+        let sid_string = ok
+            .then(|| {
+                let user = &*(buf.as_ptr() as *const TOKEN_USER);
+                let mut out = windows::core::PWSTR::null();
+                ConvertSidToStringSidW(user.User.Sid, &mut out)
+                    .ok()
+                    .map(|_| {
+                        let s = out.to_string().unwrap_or_default();
+                        let _ = LocalFree(HLOCAL(out.0 as *mut c_void));
+                        s
+                    })
+            })
+            .flatten();
+        let _ = CloseHandle(token);
+        let Some(sid) = sid_string.filter(|s| !s.is_empty()) else {
+            return 0;
+        };
+        // D: = DACL, A = allow, GA = generic all, for that SID only.
+        let sddl: Vec<u16> = format!("D:(A;;GA;;;{sid})")
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut psd = PSECURITY_DESCRIPTOR::default();
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl.as_ptr()),
+            SDDL_REVISION_1,
+            &mut psd,
+            None,
+        )
+        .is_err()
+        {
+            return 0;
+        }
+        psd.0 as usize
+    });
+    (value != 0).then_some(value as *mut c_void)
+}
+
 unsafe fn ipc_dispatch(line: &str) -> String {
     let line = line.trim();
     let mut parts = line.split_whitespace();
@@ -3177,7 +3250,25 @@ unsafe fn ipc_dispatch(line: &str) -> String {
         "launcher" => open_launcher_popup(),
         "system_menu" => open_system_popup(),
         "reload" => reload_config_now(),
-        "launch" if !argument.is_empty() => launch(&argument),
+        // Arbitrary exec is opt-in. Astur can otherwise be used as a
+        // convenient parent process by anything already running as the user
+        // (review S-02). Window-management verbs above are always available.
+        "launch" if !argument.is_empty() => {
+            if !UI_CFG
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|c| c.ipc_allow_launch)
+                .unwrap_or(false)
+            {
+                log_error!("IPC launch refused (ipc_allow_launch = false): {argument}");
+                return "error launch is disabled (set ipc_allow_launch = true)
+"
+                .to_string();
+            }
+            log_info!("IPC launch: {argument}");
+            launch(&argument);
+        }
         "status" => {
             return format!(
                 "ok windows={} launcher={} system_menu={}\n",
@@ -3196,15 +3287,29 @@ unsafe fn ipc_dispatch(line: &str) -> String {
 
 fn ipc_worker() {
     loop {
+        // Cheap check first. IPC is off by default, and this used to deep-clone
+        // the whole Config every 500 ms forever just to read one bool — pure
+        // waste on an idle desktop (review P-07).
+        let enabled = UI_CFG
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|c| c.ipc_enabled)
+            .unwrap_or(false);
+        if !enabled {
+            // Sleep on the reload condvar instead of polling: a config change
+            // wakes us immediately, and an idle desktop costs nothing at all.
+            let guard = IPC_WAKE.0.lock().unwrap();
+            let _ = IPC_WAKE
+                .1
+                .wait_timeout(guard, std::time::Duration::from_secs(30));
+            continue;
+        }
         let cfg = UI_CFG
             .lock()
             .unwrap()
             .clone()
             .unwrap_or_else(Config::defaults);
-        if !cfg.ipc_enabled {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            continue;
-        }
         let clean: String = cfg
             .ipc_pipe
             .chars()
@@ -3218,6 +3323,15 @@ fn ipc_worker() {
         let path = format!(r"\\.\pipe\{name}");
         let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
         unsafe {
+            // Explicit DACL: only this user account. The default (NULL) SD is
+            // already restrictive in practice, but "in practice" is not a
+            // security property — say what is allowed (review S-02).
+            let sd = owner_only_security_descriptor();
+            let sa = sd.map(|sd| SECURITY_ATTRIBUTES {
+                nLength: core::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: sd,
+                bInheritHandle: BOOL(0),
+            });
             let pipe = CreateNamedPipeW(
                 PCWSTR(wide.as_ptr()),
                 PIPE_ACCESS_DUPLEX,
@@ -3226,7 +3340,7 @@ fn ipc_worker() {
                 4096,
                 4096,
                 0,
-                None,
+                sa.as_ref().map(|sa| sa as *const SECURITY_ATTRIBUTES),
             );
             if pipe == INVALID_HANDLE_VALUE {
                 std::thread::sleep(std::time::Duration::from_secs(1));
@@ -3300,6 +3414,10 @@ unsafe fn restore_all_windows() {
     restore_windows(&list);
     // Everything is visible again — nothing left for the crash-rescue pass.
     let _ = std::fs::remove_file(rescue_file());
+    // Every graceful exit route funnels through here (tray Quit, Ctrl+C, End
+    // task, logoff, the panic hook), so it is also where the system-wide
+    // foreground-lock setting goes back to what the user had.
+    restore_foreground_lock();
 }
 
 /// Panic-path restore: a thread panic with `panic = "abort"` runs the panic hook
@@ -6926,6 +7044,42 @@ unsafe fn bar_widget_draw(
 /// center zone is centred in the remaining gap (the title flexes to fill).
 /// The owning monitor's HMONITOR is in GWLP_USERDATA so each bar paints its own
 /// data; the hit ranges land in BAR_LAYOUTS for the mouse handlers.
+/// Per-bar signature of everything the 1 s tick can reveal. Returns true when it
+/// differs from the last tick for this bar (and records the new value), so an
+/// idle desktop repaints roughly once a minute per monitor instead of once a
+/// second. Per bar, not global: each bar has its own timer, and a shared
+/// signature would let whichever fired first starve the others.
+///
+/// Main thread only — every bar timer runs there.
+unsafe fn bar_tick_changed(h: HWND) -> bool {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    {
+        let data = BAR.lock().unwrap();
+        format_clock_widget(&data, &GetLocalTime()).hash(&mut hasher);
+        format_date(&data.date_format, &GetLocalTime()).hash(&mut hasher);
+    }
+    for stat in [
+        &STAT_CPU,
+        &STAT_MEM,
+        &STAT_BAT,
+        &STAT_NET_D,
+        &STAT_NET_U,
+        &STAT_VOL,
+    ] {
+        stat.load(Ordering::Relaxed).hash(&mut hasher);
+    }
+    STAT_MUTE.load(Ordering::Relaxed).hash(&mut hasher);
+    MEDIA_TEXT.lock().unwrap().hash(&mut hasher);
+    let now = hasher.finish();
+    let mut seen = BAR_TICK_SIG.lock().unwrap();
+    seen.get_or_insert_with(HashMap::new)
+        .insert(h.0 as isize, now)
+        != Some(now)
+}
+
+static BAR_TICK_SIG: Mutex<Option<HashMap<isize, u64>>> = Mutex::new(None);
+
 unsafe fn paint_bar(h: HWND) {
     // Publish this bar's DPI for the whole paint. Every `bar_icon_px()` /
     // `bar_widget_gap()` call below it reads this, so no call site has to
@@ -7110,6 +7264,13 @@ unsafe extern "system" fn bar_wndproc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                     let _ = KillTimer(h, PILL_TIMER_ID);
                     pill_anim_clear(hmon);
                 }
+            } else if w.0 == BAR_TIMER_ID && !bar_tick_changed(h) {
+                // The 1 s tick exists for the clock and the stats. Astur's clock
+                // format has no seconds token, so on an idle desktop this used
+                // to repaint every bar every second to draw the identical
+                // pixels — and `paint_bar` deep-clones the whole BarData each
+                // time (review P-04). Skip when nothing it shows has changed.
+                return LRESULT(0);
             }
             let _ = InvalidateRect(h, None, BOOL(0));
             LRESULT(0)
@@ -7784,6 +7945,12 @@ const DEFAULT_LAUNCHER_SEL_RADIUS: i32 = 12; // rounded selection pill
 // config is read only by popup/menu threads through UI_CFG.
 static UI_CFG: Mutex<Option<Config>> = Mutex::new(None);
 static LAUNCHER_ENABLED: AtomicBool = AtomicBool::new(true);
+/// Woken when the config changes so the (disabled) IPC worker can re-check
+/// `ipc_enabled` immediately instead of polling for it. The 30 s timeout is a
+/// backstop, not the mechanism.
+static IPC_WAKE: LazyLock<(Mutex<()>, Condvar)> =
+    LazyLock::new(|| (Mutex::new(()), Condvar::new()));
+
 /// Window that had the foreground when the picker opened — the paste target.
 static LAUNCHER_PREV_FG: AtomicIsize = AtomicIsize::new(0);
 static SYSMENU_ENABLED: AtomicBool = AtomicBool::new(true);
@@ -7987,6 +8154,9 @@ fn apply_theme(cfg: &Config) {
     if font_changed {
         POPUP_FONT_DIRTY.store(true, Ordering::Release);
     }
+    // Let a sleeping IPC worker notice ipc_enabled without waiting out its
+    // backstop timeout.
+    IPC_WAKE.1.notify_all();
 }
 
 // ---- acrylic backdrop (experimental) ---------------------------------------
@@ -8138,6 +8308,61 @@ unsafe fn clipboard_get_text(h: HWND) -> Option<String> {
     result
 }
 
+/// True when the clipboard owner has asked history tools to leave this copy
+/// alone. Password managers, banking sites and terminals set one of these
+/// formats; Windows' own clipboard history, Ditto and ClipClip all honour them,
+/// and a clipboard history that does not is a way to leak a master password
+/// onto the screen (review S-01).
+///
+/// Two conventions are in play. `ExcludeClipboardContentFromMonitorProcessing`
+/// and `Clipboard Viewer Ignore` mean "skip this entirely" by their presence.
+/// `CanIncludeInClipboardHistory` and `CanUploadToCloudClipboard` are DWORD
+/// opt-outs: present and zero means no. Formats are registered once — the
+/// registration is process-wide and the ids never change.
+unsafe fn clipboard_is_sensitive(h: HWND) -> bool {
+    static FORMATS: OnceLock<[u32; 4]> = OnceLock::new();
+    let ids = *FORMATS.get_or_init(|| {
+        let reg = |name: PCWSTR| RegisterClipboardFormatW(name);
+        [
+            reg(w!("ExcludeClipboardContentFromMonitorProcessing")),
+            reg(w!("Clipboard Viewer Ignore")),
+            reg(w!("CanIncludeInClipboardHistory")),
+            reg(w!("CanUploadToCloudClipboard")),
+        ]
+    });
+    // Presence alone is the signal for the first two.
+    for id in ids.iter().take(2) {
+        if *id != 0 && IsClipboardFormatAvailable(*id).is_ok() {
+            return true;
+        }
+    }
+    // The last two carry a DWORD; 0 = "don't". Reading needs the clipboard open.
+    for id in ids.iter().skip(2) {
+        if *id == 0 || IsClipboardFormatAvailable(*id).is_err() {
+            continue;
+        }
+        if OpenClipboard(h).is_err() {
+            // Cannot check: treat as sensitive. Missing one copy in the history
+            // is a far smaller cost than capturing a password.
+            return true;
+        }
+        let deny = (|| {
+            let data = GetClipboardData(*id).ok()?;
+            let global = windows::Win32::Foundation::HGLOBAL(data.0);
+            let ptr = GlobalLock(global) as *const u32;
+            let value = (!ptr.is_null()).then(|| *ptr);
+            let _ = GlobalUnlock(global);
+            Some(value? == 0)
+        })()
+        .unwrap_or(true);
+        let _ = CloseClipboard();
+        if deny {
+            return true;
+        }
+    }
+    false
+}
+
 unsafe fn clipboard_capture(h: HWND) {
     let cfg = UI_CFG
         .lock()
@@ -8145,6 +8370,10 @@ unsafe fn clipboard_capture(h: HWND) {
         .clone()
         .unwrap_or_else(Config::defaults);
     if !cfg.clipboard_history {
+        return;
+    }
+    if clipboard_is_sensitive(h) {
+        log_debug!("clipboard capture skipped: owner marked the content sensitive");
         return;
     }
     let Some(text) = clipboard_get_text(h) else {
@@ -12121,6 +12350,20 @@ unsafe fn diagnostics_report(dpi_aware: bool) -> String {
         log_path().display(),
         log_level_name(LOG_LEVEL.load(Ordering::Relaxed)),
     ));
+    {
+        let cfg = load_config();
+        if cfg.unknown_keys.is_empty() {
+            out.push_str("  config keys    : all understood\n");
+        } else {
+            out.push_str(&format!(
+                "  config keys    : {} NOT understood (ignored):\n",
+                cfg.unknown_keys.len()
+            ));
+            for key in &cfg.unknown_keys {
+                out.push_str(&format!("      {key}\n"));
+            }
+        }
+    }
     out.push_str(&format!(
         "  hook re-arms   : {}\n",
         HOOK_REARMS.load(Ordering::Relaxed)
@@ -12189,6 +12432,55 @@ unsafe fn attach_parent_console() {
         return; // redirected to a file or pipe: leave it alone
     }
     let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+}
+
+// --- foreground lock (system-wide setting; saved and restored) --------------
+
+/// Previous SPI_SETFOREGROUNDLOCKTIMEOUT value, +1 so that 0 means "we never
+/// changed it" and the restore path is a no-op on every other exit route.
+static FOREGROUND_LOCK_PREV: AtomicU32 = AtomicU32::new(0);
+
+unsafe fn disable_foreground_lock() {
+    let mut prev: u32 = 0;
+    let read = SystemParametersInfoW(
+        SPI_GETFOREGROUNDLOCKTIMEOUT,
+        0,
+        Some(&mut prev as *mut u32 as *mut c_void),
+        SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+    )
+    .is_ok();
+    if SystemParametersInfoW(
+        SPI_SETFOREGROUNDLOCKTIMEOUT,
+        0,
+        Some(core::ptr::null_mut()),
+        SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+    )
+    .is_err()
+    {
+        log_error!("could not disable the foreground lock timeout; focus changes may not stick");
+        return;
+    }
+    if read {
+        FOREGROUND_LOCK_PREV.store(prev.saturating_add(1), Ordering::Relaxed);
+        log_info!("foreground lock timeout {prev} -> 0 (restored on exit)");
+    }
+}
+
+/// Put the system setting back. Safe to call more than once and from any exit
+/// path; a hard kill obviously cannot run it, which is why the value is only
+/// ever set to what the user already had.
+unsafe fn restore_foreground_lock() {
+    let saved = FOREGROUND_LOCK_PREV.swap(0, Ordering::Relaxed);
+    if saved == 0 {
+        return;
+    }
+    let mut value = saved - 1;
+    let _ = SystemParametersInfoW(
+        SPI_SETFOREGROUNDLOCKTIMEOUT,
+        0,
+        Some(&mut value as *mut u32 as *mut c_void),
+        SPIF_SENDCHANGE,
+    );
 }
 
 fn main() {
@@ -12405,12 +12697,12 @@ fn main() {
         let _ = SetConsoleCtrlHandler(Some(console_handler), BOOL(1));
 
         // Reduce the foreground lock so the manager can focus windows reliably.
-        let _ = SystemParametersInfoW(
-            SPI_SETFOREGROUNDLOCKTIMEOUT,
-            0,
-            Some(core::ptr::null_mut()),
-            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-        );
+        // This is SYSTEM-WIDE, affecting every application, so remember the old
+        // value and put it back on a graceful exit (review S-03) — leaving the
+        // machine in a changed state after quitting is not ours to do.
+        if cfg.foreground_lock_disable {
+            disable_foreground_lock();
+        }
 
         // React to windows opening/closing/focusing for tiling. Out-of-context
         // callbacks run on this thread's message loop; own-process events skipped.

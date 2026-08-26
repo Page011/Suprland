@@ -823,12 +823,21 @@ unsafe extern "system" fn marker_wndproc(h: HWND, msg: u32, w: WPARAM, l: LPARAM
         return DefWindowProcW(h, msg, w, l);
     }
     if msg == WM_DISPLAYCHANGE || msg == WM_DPICHANGED {
-        // Reconcile fullscreen monitor handles, reposition/create bars, retile.
-        // A scale change raises WM_DISPLAYCHANGE too, so this one path covers
-        // resolution, monitor add/remove and DPI alike.
+        // Do NOTHING synchronously here. Resolution, monitor add/remove and
+        // scale changes all arrive as these two messages, often several in a
+        // row, and the rebuild moves windows — which delivers more of them.
+        // See `request_bar_rebuild`.
+        request_bar_rebuild();
+        return LRESULT(0);
+    } else if msg == WM_REBUILD_BARS {
+        // The deferred rebuild, running on a clean stack.
+        BARS_REBUILD_PENDING.store(false, Ordering::Relaxed);
         seed_fullscreen_windows();
+        // Snapshots and per-DPI fonts were sized for the old scale.
+        bar_fonts_clear();
         ensure_bars();
         push_cmd(Cmd::RefreshMonitors);
+        return LRESULT(0);
     } else if msg == WM_RELOAD {
         // Config changed: drop the per-DPI fonts and rebuild bars (must happen
         // on this thread so it can't race a paint; they are rebuilt lazily on
@@ -2104,6 +2113,9 @@ const WM_RELOAD: u32 = WM_USER + 2;
 // Custom message (to the marker window): the watchdog believes the low-level
 // hooks are gone. Re-arming must happen on the thread that owns them.
 const WM_REARM_HOOKS: u32 = WM_USER + 6;
+// Custom message (to the marker window): rebuild bar geometry, once, OUTSIDE
+// the message that asked for it. See `request_bar_rebuild`.
+const WM_REBUILD_BARS: u32 = WM_USER + 7;
 // SetTimer id for the bar clock tick.
 const BAR_TIMER_ID: usize = 1;
 
@@ -2176,8 +2188,20 @@ unsafe fn install_hooks(hinst: HINSTANCE) -> bool {
 
 /// Watchdog loop. Cheap: one GetLastInputInfo every 5 s, no locks.
 fn hook_watchdog() {
+    // Re-arms are attempted with a backoff. The first version logged and posted
+    // every 5 s forever, and stamped HOOK_TICK itself so it "would not re-fire
+    // too soon" — which reset the very measurement it was reporting, so every
+    // line after the first read exactly 5000 ms and the real, growing outage was
+    // invisible. Don't do that: never let a detector write to the thing it
+    // detects on.
+    let mut backoff_ms = 5_000u64;
+    let mut attempts = 0u32;
+    let mut reported_wedged = false;
+    // Re-arm count at the moment we last posted, so "did the main thread act on
+    // it?" stays a correct question after the first successful re-arm.
+    let mut posted_at: Option<u32> = None;
     loop {
-        std::thread::sleep(std::time::Duration::from_millis(5_000));
+        std::thread::sleep(std::time::Duration::from_millis(backoff_ms.min(60_000)));
         unsafe {
             let mut lii = LASTINPUTINFO {
                 cbSize: core::mem::size_of::<LASTINPUTINFO>() as u32,
@@ -2189,19 +2213,35 @@ fn hook_watchdog() {
             let idle_ms = GetTickCount().wrapping_sub(lii.dwTime);
             let silence_ms = GetTickCount64().saturating_sub(HOOK_TICK.load(Ordering::Relaxed));
             if idle_ms > WATCHDOG_INPUT_WINDOW_MS || silence_ms < WATCHDOG_SILENCE_MS {
-                continue; // either nobody is typing, or the hooks are fine
+                // Healthy: forget any previous trouble.
+                backoff_ms = 5_000;
+                attempts = 0;
+                posted_at = None;
+                reported_wedged = false;
+                continue;
             }
-            // Input is happening and neither hook has fired: Windows dropped
-            // them. Re-arm on the owning thread.
             let marker = MARKER_HWND.load(Ordering::Relaxed);
-            if marker != 0 {
-                log_error!(
-                    "hooks silent for {silence_ms} ms with input {idle_ms} ms ago — re-arming"
-                );
-                let _ = PostMessageW(hwnd_from(marker), WM_REARM_HOOKS, WPARAM(0), LPARAM(0));
-                // Don't re-fire until the re-arm has had a chance to land.
-                hook_alive_stamp();
+            if marker == 0 {
+                continue;
             }
+            // A re-arm can only happen on the thread that owns the hooks, so if
+            // that thread is not pumping messages, posting is pointless. Tell
+            // the two failures apart — they have completely different causes.
+            if posted_at.is_some_and(|n| HOOK_REARMS.load(Ordering::Relaxed) == n) {
+                if !reported_wedged {
+                    reported_wedged = true;
+                    log_error!(
+                        "hooks silent {silence_ms} ms and {attempts} re-arm request(s) went                          unprocessed — the main thread is not pumping messages. Astur cannot                          recover from here; this is a deadlock or a re-entrant wndproc, not a                          dropped hook."
+                    );
+                }
+                backoff_ms = (backoff_ms * 2).min(60_000);
+                continue;
+            }
+            attempts += 1;
+            posted_at = Some(HOOK_REARMS.load(Ordering::Relaxed));
+            log_error!("hooks silent for {silence_ms} ms with input {idle_ms} ms ago — re-arming");
+            let _ = PostMessageW(hwnd_from(marker), WM_REARM_HOOKS, WPARAM(0), LPARAM(0));
+            backoff_ms = (backoff_ms * 2).min(60_000);
         }
     }
 }
@@ -5921,7 +5961,72 @@ unsafe fn bar_autohide_tick(h: HWND) {
     }
 }
 
+/// True while `ensure_bars` is running; set again if something asks for another
+/// pass while one is in flight. Plain atomics rather than a Mutex on purpose:
+/// this guards RE-ENTRANCY on one thread, not access from several. Every caller
+/// is on the main thread.
+static ENSURE_BARS_BUSY: AtomicBool = AtomicBool::new(false);
+static ENSURE_BARS_AGAIN: AtomicBool = AtomicBool::new(false);
+
+/// Ask for a bar rebuild without doing it here.
+///
+/// This exists because `ensure_bars` calls `SetWindowPos` on the bars, and
+/// Windows delivers `WM_DPICHANGED` **synchronously** to a window whose DPI
+/// changes as a result. Calling `ensure_bars` straight out of a `WM_DPICHANGED`
+/// handler therefore re-enters it, from inside its own `SetWindowPos`, once per
+/// bar, per monitor — which wedged the main thread solid on a scale change.
+/// A wedged main thread is not a cosmetic bug: the low-level hooks are
+/// dispatched on it, so Windows drops them past `LowLevelHooksTimeout` and the
+/// whole WM goes deaf. (2026-08-26; the watchdog reported it and could not fix
+/// it, because the thread it needed to re-arm on was the wedged one.)
+///
+/// So: coalesce into one posted message and let the pump deliver it after the
+/// DPI change has finished unwinding.
+unsafe fn request_bar_rebuild() {
+    if BARS_REBUILD_PENDING.swap(true, Ordering::Relaxed) {
+        return; // one is already queued; N windows x N monitors collapse to one
+    }
+    let marker = MARKER_HWND.load(Ordering::Relaxed);
+    if marker == 0 {
+        BARS_REBUILD_PENDING.store(false, Ordering::Relaxed);
+        return;
+    }
+    if PostMessageW(hwnd_from(marker), WM_REBUILD_BARS, WPARAM(0), LPARAM(0)).is_err() {
+        BARS_REBUILD_PENDING.store(false, Ordering::Relaxed);
+    }
+}
+static BARS_REBUILD_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Re-entrancy-safe wrapper. Never called recursively: an inner request is
+/// folded into one more pass by the outer call instead.
 unsafe fn ensure_bars() {
+    if ENSURE_BARS_BUSY.swap(true, Ordering::Relaxed) {
+        ENSURE_BARS_AGAIN.store(true, Ordering::Relaxed);
+        return;
+    }
+    // Bounded: geometry converges in one pass normally, two if a bar crossed a
+    // DPI boundary while being placed. The cap makes a livelock impossible.
+    for _ in 0..4 {
+        ENSURE_BARS_AGAIN.store(false, Ordering::Relaxed);
+        ensure_bars_inner();
+        if !ENSURE_BARS_AGAIN.load(Ordering::Relaxed) {
+            break;
+        }
+    }
+    ENSURE_BARS_BUSY.store(false, Ordering::Relaxed);
+}
+
+/// DANGER, and the reason `ensure_bars` has a re-entrancy guard: this function
+/// holds `BARS.lock()` across `SetWindowPos` and `CreateWindowExW`, both of
+/// which dispatch messages to our own wndprocs SYNCHRONOUSLY. If one of those
+/// handlers calls back in here, `BARS.lock()` deadlocks against itself — a
+/// std Mutex is not reentrant — and the main thread stops pumping forever. That
+/// is not a cosmetic failure: the low-level hooks are dispatched on this thread,
+/// so Windows drops them and the whole WM goes deaf with no way back.
+///
+/// It happened, on 2026-08-26, the first time a user changed display scale.
+/// Never call this directly from a wndproc; use `request_bar_rebuild`.
+unsafe fn ensure_bars_inner() {
     // Logical (100%) values straight from the config; each monitor scales them
     // by its own DPI below, so a mixed-DPI desk gets a correctly sized bar on
     // both screens.
@@ -7374,10 +7479,12 @@ unsafe extern "system" fn bar_wndproc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -
         // height/margin/radius from the new DPI, and RefreshMonitors re-reserves
         // the work area and clears the stale-scale snapshots. The font cache is
         // keyed by DPI, so the next paint builds the new one by itself.
+        // The scale of the monitor this bar sits on changed. Rebuilding here
+        // would re-enter this handler from inside its own SetWindowPos — see
+        // `request_bar_rebuild`. Ask, repaint, return.
         WM_DPICHANGED => {
-            ensure_bars();
+            request_bar_rebuild();
             let _ = InvalidateRect(h, None, BOOL(0));
-            push_cmd(Cmd::RefreshMonitors);
             LRESULT(0)
         }
         _ => DefWindowProcW(h, msg, w, l),
@@ -7950,6 +8057,11 @@ static LAUNCHER_ENABLED: AtomicBool = AtomicBool::new(true);
 /// backstop, not the mechanism.
 static IPC_WAKE: LazyLock<(Mutex<()>, Condvar)> =
     LazyLock::new(|| (Mutex::new(()), Condvar::new()));
+
+/// Set while a popup is repositioning itself, so a `WM_DPICHANGED` raised BY
+/// that reposition does not recurse into it. The launcher and the system menu
+/// are never open at the same time, so one flag covers both.
+static POPUP_PLACING: AtomicBool = AtomicBool::new(false);
 
 /// Window that had the foreground when the picker opened — the paste target.
 static LAUNCHER_PREV_FG: AtomicIsize = AtomicIsize::new(0);
@@ -11016,11 +11128,20 @@ unsafe extern "system" fn launcher_wndproc(h: HWND, msg: u32, w: WPARAM, l: LPAR
         // Scale changed under an open popup: re-place it (which re-reads
         // UI_DPI) and let the next paint rebuild the font.
         WM_DPICHANGED => {
-            launcher_place(
-                h,
-                launcher_target_work_area(),
-                LAUNCHER_STATE.lock().unwrap().wide,
-            );
+            // Two traps here, both hit by the same re-entrancy:
+            //  1. `LAUNCHER_STATE.lock().unwrap().wide` passed as an ARGUMENT
+            //     keeps the guard alive for the whole call. launcher_place ->
+            //     SetWindowPos -> a synchronous WM_DPICHANGED back into this
+            //     arm -> lock() on a std Mutex we already hold = deadlock, on
+            //     the launcher thread, permanently.
+            //  2. Even without that, re-placing from inside the message that
+            //     announced the move recurses. See `request_bar_rebuild` for
+            //     the same problem on the bars.
+            let wide = LAUNCHER_STATE.lock().unwrap().wide;
+            if !POPUP_PLACING.swap(true, Ordering::Relaxed) {
+                launcher_place(h, launcher_target_work_area(), wide);
+                POPUP_PLACING.store(false, Ordering::Relaxed);
+            }
             LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),
@@ -11866,7 +11987,12 @@ unsafe extern "system" fn sysmenu_wndproc(h: HWND, msg: u32, w: WPARAM, l: LPARA
             LRESULT(0)
         }
         WM_DPICHANGED => {
-            sysmenu_layout(h);
+            // Same re-entrancy guard as the launcher: sysmenu_layout moves the
+            // window, which can deliver this message again from inside it.
+            if !POPUP_PLACING.swap(true, Ordering::Relaxed) {
+                sysmenu_layout(h);
+                POPUP_PLACING.store(false, Ordering::Relaxed);
+            }
             LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),
@@ -12162,6 +12288,13 @@ unsafe fn claim_single_instance() -> bool {
 
 /// Probe without taking it (used by `--check`).
 unsafe fn instance_already_running() -> bool {
+    // If WE hold it, the answer is no. Without this the running WM's own
+    // startup report says "a second Astur is running" and points at itself —
+    // a false alarm in exactly the diagnostic people would paste into a bug
+    // report.
+    if INSTANCE_LOCK.load(Ordering::Relaxed) != 0 {
+        return false;
+    }
     match OpenMutexW(
         SYNCHRONIZATION_ACCESS_RIGHTS(PROCESS_SYNCHRONIZE.0),
         false,
@@ -12449,15 +12582,26 @@ unsafe fn disable_foreground_lock() {
         SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
     )
     .is_ok();
-    if SystemParametersInfoW(
+    if read && prev == 0 {
+        return; // already off; nothing to change and nothing to restore
+    }
+    // pvParam carries the new timeout BY VALUE (a UINT in a PVOID), and the
+    // call wants SPIF_SENDCHANGE — without it Windows can report failure even
+    // though the docs read as if uiParam alone were enough. The old code passed
+    // a null pvParam with no flags and had its result discarded, so this had
+    // most likely never worked; nobody could tell, which is the point of the
+    // logging work.
+    let ok = SystemParametersInfoW(
         SPI_SETFOREGROUNDLOCKTIMEOUT,
         0,
         Some(core::ptr::null_mut()),
-        SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        SPIF_SENDCHANGE,
     )
-    .is_err()
-    {
-        log_error!("could not disable the foreground lock timeout; focus changes may not stick");
+    .is_ok();
+    if !ok {
+        // Advisory, not fatal: focus changes still work, they can occasionally
+        // flash in the taskbar instead of taking. Not an ERROR.
+        log_info!("foreground lock timeout unchanged (SystemParametersInfoW refused it)");
         return;
     }
     if read {

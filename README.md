@@ -101,6 +101,10 @@ Manager) too.
 - **Light / dark theme** *(Astur)* — the launcher and menus follow `theme = dark |
   light | auto` (auto tracks the Windows app theme); optional experimental acrylic
   blur behind the popups.
+- **High-DPI aware** — per-monitor DPI v2. Tiles fill the whole work area at any
+  display scale, and the bar, launcher and menus are scaled per monitor, so a
+  100% screen next to a 150% one both look right. Sizes in the config are
+  logical pixels at 100%.
 - **Extras** — coloured borders, unfocused dimming, focus-follows-mouse, rich
   exe/class/title window rules with workspace/monitor routing, arbitrary Alt chords,
   and live config hot-reload.
@@ -214,6 +218,17 @@ power menu, with a single-exe (Lite) option and no required config file.
 **Does it work on Windows 11?** Yes, on Windows 10 and 11, x64.
 
 **Do I need admin rights?** No. Running as admin lets it manage elevated windows too.
+
+**Does it work with display scaling (125% / 150%)?** Yes, from 2.1.3 on. Astur is
+per-monitor-DPI aware, including mixed-scale multi-monitor setups. (Earlier
+versions tiled into the top-left corner of a scaled screen — that was
+[issue #5](https://github.com/Page011/Astur/issues/5).)
+
+**Something is not working — what do I send?** Run `astur.exe --check` in a
+terminal. It prints and saves a short report (version, Windows build, DPI
+awareness, every monitor and its scale, config paths). For more, set
+`log_level = info` in `astur.conf` and attach
+`%USERPROFILE%\.asturstur.log`.
 
 **What's the difference between Astur and Astur Lite?** See [Editions](#editions) —
 Lite is minimal ~1 MB console exe; Astur adds configurable launcher/search, system

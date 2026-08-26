@@ -121,7 +121,26 @@ pub struct Config {
     pub media_enabled: bool,
     pub ipc_enabled: bool,
     pub ipc_pipe: String,
+    /// Allow the IPC `launch` verb to run arbitrary commands. Off by default:
+    /// scripting a window manager rarely needs arbitrary exec, and leaving it on
+    /// makes Astur a convenient parent process for something else already
+    /// running as the user.
+    pub ipc_allow_launch: bool,
+    /// Disable Windows' foreground-lock timeout so focus changes are reliable.
+    /// This is a GLOBAL, system-wide setting; Astur restores the previous value
+    /// on a graceful exit.
+    pub foreground_lock_disable: bool,
     pub persist_state: bool,
+    /// Diagnostics verbosity: off | error | info | debug. Astur ships without a
+    /// console, so this file log is the only way a user can report what broke.
+    pub log_level: String,
+    /// `file: key` for every line the parser did not understand. Ignoring
+    /// unknown keys keeps old and new configs loadable, but silently ignoring
+    /// them means a typo (`bar_heigth = 40`) does nothing and says nothing —
+    /// with 140+ keys across two files that is the likeliest user error there
+    /// is. Collected here so the WM can log it and the GUI can show it.
+    /// Not written back to disk, and not part of "has the user edited this".
+    pub unknown_keys: Vec<String>,
     pub extra_hotkeys: Vec<HotkeyDef>,
     pub window_rules: Vec<WindowRule>,
     pub bar_enabled: bool,         // draw the status bar on every monitor
@@ -320,7 +339,11 @@ impl Config {
             media_enabled: false,
             ipc_enabled: false,
             ipc_pipe: "astur".to_string(),
+            ipc_allow_launch: false,
+            foreground_lock_disable: true,
             persist_state: true,
+            log_level: "error".to_string(),
+            unknown_keys: Vec::new(),
             extra_hotkeys: vec![HotkeyDef {
                 chord: "ALT+GRAVE".to_string(),
                 action: "scratchpad".to_string(),
@@ -414,6 +437,14 @@ const DEFAULT_CONFIG: &str = "\
 # Syntax   : one  key = value  per line. '#' starts a comment. Blank lines and
 #            surrounding whitespace are ignored. Unknown keys are ignored, so a
 #            typo silently falls back to the default below rather than erroring.
+#            Set log_level = info to have unknown keys reported in astur.log.
+#
+# Pixels   : every size here is a LOGICAL pixel, i.e. what it measures on a
+#            100%-scale display. Astur is per-monitor-DPI aware, so a bar height
+#            of 28 draws as 28 px at 100%, 35 px at 125% and 42 px at 150%, and
+#            two monitors at different scales each get the right physical size.
+#            (Before 2.1.3 the whole process was DPI-unaware; these numbers were
+#            stretched by Windows instead, which also broke tiling — issue #5.)
 #
 # Value types:
 #   bool   : true / false   (also accepts yes/no, 1/0, on/off; anything else
@@ -550,7 +581,7 @@ theme = dark
 # look). Uses an undocumented Windows API; if popups render oddly, turn it off.
 # bool
 acrylic = false
-# Popup typography and geometry. Sizes are pixels in current process DPI mode.
+# Popup typography and geometry. See the pixel note at the top of this file.
 popup_font_name = Segoe UI
 popup_font_size = 18
 popup_font_weight = 400
@@ -566,6 +597,11 @@ popup_accent_fg = auto
 popup_border = auto
 
 # Dim unfocused windows to this opacity.  float 0.10 - 1.00  (1.0 = disabled)
+# Trade-off worth knowing: any value below 1.0 makes Astur add WS_EX_LAYERED to
+# every window it manages, which puts those apps on a different composition
+# path. A few (older games, some capture tools and Electron overlays) behave
+# differently when layered. Set 1.0 to leave app window styles untouched.
+# Astur removes the style again when it quits or reloads with dimming off.
 unfocused_opacity = 0.8
 
 # Coloured window borders. Requires Windows 11 (no effect on Windows 10).  bool
@@ -657,9 +693,29 @@ wallpaper_dir =
 workspace_wallpapers =
 media_enabled = false
 persist_state = true
+# Diagnostics log at %USERPROFILE%\\.astur\\astur.log (rotates at 1 MB).
+#   off   = write nothing
+#   error = failures only (default)
+#   info  = + startup environment, monitors/DPI, hook re-arms, config reloads
+#   debug = + per-command detail. Verbose; for reproducing a bug.
+# Run `astur.exe --check` for a paste-ready diagnostics dump.
+log_level = error
 # Local named-pipe command API. Pipe name only; no remote/network listener.
+# The pipe is restricted to your own user account and rejects remote clients.
 ipc_enabled = false
 ipc_pipe = astur
+# Allow `launch <command>` over IPC to run arbitrary commands. Window-management
+# verbs (switch/move/focus/layout/...) work regardless. Leave this off unless you
+# actually script launching through Astur: on, any process running as you can use
+# Astur as the parent process for a command of its choosing.
+ipc_allow_launch = false
+
+# Windows normally refuses to let a background app steal the foreground. Astur
+# disables that timeout so focus changes land reliably. It is a SYSTEM-WIDE
+# setting affecting every application, not just Astur; the previous value is put
+# back when Astur exits gracefully. Set false to leave the system setting alone
+# (focus may occasionally flash in the taskbar instead of switching).
+foreground_lock_disable = true
 # Extra bindings: chord|action|argument ;; chord|action|argument
 # Escape literal field separators with a leading backslash.
 extra_hotkeys = ALT+GRAVE|scratchpad|
@@ -714,6 +770,10 @@ const DEFAULT_NAVBAR: &str = "\
 # bar. Click a workspace pill to switch to it.
 #
 # Value types: bool, int, colour (#RRGGBB) -- see astur.conf for details.
+#
+# Pixels: every size here is a LOGICAL pixel (what it measures at 100% scale).
+# Astur scales the bar per monitor, so height = 28 draws 28 px at 100% and
+# 42 px at 150%, correctly on each screen of a mixed-scale setup.
 # ============================================================================
 
 # Show the bars.  bool   (set false to disable entirely)
@@ -1172,9 +1232,9 @@ fn read_or_create(path: &std::path::Path, default: &str) -> String {
 pub fn load_config() -> Config {
     let mut c = Config::defaults();
     let wm = config_path("ASTUR_CONFIG", "astur.conf");
-    parse_into(&mut c, &read_or_create(&wm, DEFAULT_CONFIG));
+    parse_into_from(&mut c, &read_or_create(&wm, DEFAULT_CONFIG), "astur.conf");
     let nav = config_path("ASTUR_NAVBAR", "navbar.conf");
-    parse_into(&mut c, &read_or_create(&nav, DEFAULT_NAVBAR));
+    parse_into_from(&mut c, &read_or_create(&nav, DEFAULT_NAVBAR), "navbar.conf");
     c
 }
 
@@ -1183,6 +1243,12 @@ pub fn load_config() -> Config {
 /// (navbar.conf, unprefixed) so either file may set either, and old configs that
 /// used the `bar_*` names keep working.
 fn parse_into(c: &mut Config, text: &str) {
+    parse_into_from(c, text, "")
+}
+
+/// `parse_into` with a source label, so an unknown key can say which file it
+/// came from.
+fn parse_into_from(c: &mut Config, text: &str, source: &str) {
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -1414,6 +1480,13 @@ fn parse_into(c: &mut Config, text: &str) {
                 }
             }
             "persist_state" => c.persist_state = parse_bool(v),
+            "ipc_allow_launch" => c.ipc_allow_launch = parse_bool(v),
+            "foreground_lock_disable" => c.foreground_lock_disable = parse_bool(v),
+            "log_level" => {
+                if matches!(v, "off" | "error" | "info" | "debug") {
+                    c.log_level = v.to_string()
+                }
+            }
             "extra_hotkeys" => c.extra_hotkeys = parse_hotkeys(v),
             "window_rules" => c.window_rules = parse_window_rules(v),
             "ignore_classes" => c.ignore_classes = parse_list(v),
@@ -1568,7 +1641,16 @@ fn parse_into(c: &mut Config, text: &str) {
             "left" | "bar_left" => c.bar_left = parse_widgets(v),
             "center" | "centre" | "bar_center" => c.bar_center = parse_widgets(v),
             "right" | "bar_right" => c.bar_right = parse_widgets(v),
-            _ => {}
+            other => {
+                let label = if source.is_empty() {
+                    other.to_string()
+                } else {
+                    format!("{source}: {other}")
+                };
+                if !c.unknown_keys.contains(&label) {
+                    c.unknown_keys.push(label);
+                }
+            }
         }
     }
 }
@@ -1640,8 +1722,8 @@ pub fn parse_text(text: &str) -> Config {
 /// Parse both files' text in load order (astur.conf then navbar.conf).
 pub fn parse_pair(wm_text: &str, nav_text: &str) -> Config {
     let mut c = Config::defaults();
-    parse_into(&mut c, wm_text);
-    parse_into(&mut c, nav_text);
+    parse_into_from(&mut c, wm_text, "astur.conf");
+    parse_into_from(&mut c, nav_text, "navbar.conf");
     c
 }
 
@@ -1665,6 +1747,52 @@ pub fn vk_to_key(vk: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_keys_are_reported_not_swallowed() {
+        // The single likeliest user error with 140+ keys across two files.
+        // Silence here is what F-B7 was about.
+        let c = parse_pair(
+            "bar_heigth = 40
+outer_gap = 12
+",
+            "heigth = 30
+",
+        );
+        assert_eq!(c.outer_gap, 12, "known keys still apply");
+        assert_eq!(
+            c.unknown_keys,
+            vec![
+                "astur.conf: bar_heigth".to_string(),
+                "navbar.conf: heigth".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn a_clean_config_reports_nothing() {
+        // Guards against the opposite failure: warning about every key in our
+        // own shipped templates, which would train users to ignore the warning.
+        let c = parse_pair(default_config_text(), default_navbar_text());
+        assert!(
+            c.unknown_keys.is_empty(),
+            "the shipped templates must parse cleanly: {:?}",
+            c.unknown_keys
+        );
+    }
+
+    #[test]
+    fn comments_and_blank_lines_are_not_unknown_keys() {
+        let c = parse_text(
+            "# comment = value
+
+   
+outer_gap = 4
+",
+        );
+        assert!(c.unknown_keys.is_empty());
+        assert_eq!(c.outer_gap, 4);
+    }
 
     #[test]
     fn parse_bool_variants() {

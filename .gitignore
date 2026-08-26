@@ -12,3 +12,6 @@
 # Windows
 Thumbs.db
 Desktop.ini
+
+# Review / audit output (internal, same policy as plan/)
+/review/

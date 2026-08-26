@@ -18,7 +18,9 @@
 // (Astur Lite, the `lite` branch, keeps its console.)
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU64, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicI32, AtomicIsize, AtomicU32, AtomicU64, AtomicU8, Ordering,
+};
 use std::sync::{Condvar, LazyLock, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -35,8 +37,8 @@ use layout::{
 use windows::core::{w, PCWSTR};
 use windows::core::{IUnknown, Interface, GUID};
 use windows::Win32::Foundation::{
-    CloseHandle, BOOL, BOOLEAN, COLORREF, HANDLE, HINSTANCE, HWND, INVALID_HANDLE_VALUE, LPARAM,
-    LRESULT, LUID, POINT, RECT, SIZE, SYSTEMTIME, WPARAM,
+    CloseHandle, LocalFree, BOOL, BOOLEAN, COLORREF, HANDLE, HINSTANCE, HLOCAL, HWND,
+    INVALID_HANDLE_VALUE, LPARAM, LRESULT, LUID, POINT, RECT, SIZE, SYSTEMTIME, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::{
     AlphaBlend, BeginPaint, BitBlt, CombineRgn, CreateBitmap, CreateCompatibleBitmap,
@@ -55,9 +57,13 @@ use windows::Win32::Media::Audio::{
     eConsole, eRender, Endpoints::IAudioEndpointVolume, IMMDeviceEnumerator, MMDeviceEnumerator,
 };
 use windows::Win32::NetworkManagement::IpHelper::{FreeMibTable, GetIfTable2, MIB_IF_TABLE2};
+use windows::Win32::Security::Authorization::{
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+};
 use windows::Win32::Security::{
-    AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED,
-    SE_SHUTDOWN_NAME, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    AdjustTokenPrivileges, GetTokenInformation, LookupPrivilegeValueW, TokenUser,
+    LUID_AND_ATTRIBUTES, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, SE_PRIVILEGE_ENABLED,
+    SE_SHUTDOWN_NAME, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER,
 };
 use windows::Win32::Storage::FileSystem::{
     ReadFile, WriteFile, FILE_ATTRIBUTE_NORMAL, FILE_FLAGS_AND_ATTRIBUTES, PIPE_ACCESS_DUPLEX,
@@ -66,10 +72,12 @@ use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CLSCTX_ALL, CLSCTX_INPROC_SERVER,
     COINIT_APARTMENTTHREADED,
 };
-use windows::Win32::System::Console::SetConsoleCtrlHandler;
+use windows::Win32::System::Console::{
+    AttachConsole, GetStdHandle, SetConsoleCtrlHandler, ATTACH_PARENT_PROCESS, STD_OUTPUT_HANDLE,
+};
 use windows::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
-    IsClipboardFormatAvailable, OpenClipboard, SetClipboardData,
+    IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
 };
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
@@ -78,7 +86,9 @@ use windows::Win32::System::Pipes::{
     PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 use windows::Win32::System::Power::SetSuspendState;
-use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
+use windows::Win32::System::Registry::{
+    RegGetValueW, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ,
+};
 use windows::Win32::System::Search::{
     IAccessor, ICommand, ICommandText, IDBCreateCommand, IDBCreateSession, IDBInitialize,
     IDataInitialize, IRowset, DBACCESSOR_ROWDATA, DBBINDING, DBMEMOWNER_PROVIDEROWNED,
@@ -89,13 +99,14 @@ use windows::Win32::System::Shutdown::{
     ExitWindowsEx, LockWorkStation, EWX_FORCEIFHUNG, EWX_LOGOFF, EWX_REBOOT, EWX_SHUTDOWN,
     SHUTDOWN_REASON,
 };
-use windows::Win32::System::SystemInformation::{GetLocalTime, GetTickCount64};
+use windows::Win32::System::SystemInformation::{GetLocalTime, GetTickCount, GetTickCount64};
 use windows::Win32::UI::Controls::{IImageList, ILD_TRANSPARENT};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, GetKeyState, SendInput, ToUnicode, INPUT, INPUT_0, INPUT_KEYBOARD,
-    KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VIRTUAL_KEY, VK_BACK, VK_CAPITAL, VK_CONTROL,
-    VK_DOWN, VK_ESCAPE, VK_LBUTTON, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_MENU, VK_RBUTTON,
-    VK_RCONTROL, VK_RETURN, VK_RMENU, VK_RSHIFT, VK_SPACE, VK_TAB, VK_UP,
+    GetAsyncKeyState, GetKeyState, GetLastInputInfo, SendInput, ToUnicode, INPUT, INPUT_0,
+    INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, LASTINPUTINFO, VIRTUAL_KEY,
+    VK_BACK, VK_CAPITAL, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LBUTTON, VK_LCONTROL, VK_LEFT,
+    VK_LMENU, VK_LSHIFT, VK_MENU, VK_RBUTTON, VK_RCONTROL, VK_RETURN, VK_RMENU, VK_RSHIFT,
+    VK_SPACE, VK_TAB, VK_UP,
 };
 use windows::Win32::UI::Shell::{
     BHID_EnumItems, IEnumShellItems, IShellItem, IShellItemImageFactory,
@@ -114,8 +125,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetAncestor,
     GetDesktopWindow, GetMessageW, GetShellWindow, GetWindowRect, IsZoomed, RegisterClassW,
     SetCursorPos, SetLayeredWindowAttributes, SetWindowPos, SetWindowsHookExW, ShowWindow,
-    TranslateMessage, UnhookWindowsHookEx, WindowFromPoint, GA_ROOT, HC_ACTION, HWND_TOPMOST,
-    KBDLLHOOKSTRUCT, LLKHF_INJECTED, LWA_ALPHA, MSG, MSLLHOOKSTRUCT, SWP_NOACTIVATE,
+    TranslateMessage, UnhookWindowsHookEx, WindowFromPoint, GA_ROOT, HC_ACTION, HHOOK,
+    HWND_TOPMOST, KBDLLHOOKSTRUCT, LLKHF_INJECTED, LWA_ALPHA, MSG, MSLLHOOKSTRUCT, SWP_NOACTIVATE,
     SWP_NOSENDCHANGING, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_RESTORE, SW_SHOWNA,
     WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
     WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW,
@@ -134,27 +145,282 @@ use windows::Win32::Graphics::Dwm::{
 };
 use windows::Win32::Storage::Xps::{PrintWindow, PRINT_WINDOW_FLAGS};
 use windows::Win32::System::Threading::{
-    AttachThreadInput, GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId, OpenProcess,
-    OpenProcessToken, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
-    PROCESS_QUERY_LIMITED_INFORMATION,
+    AttachThreadInput, CreateMutexW, GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId,
+    OpenMutexW, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW, WaitForSingleObject,
+    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    SYNCHRONIZATION_ACCESS_RIGHTS,
 };
 use windows::Win32::UI::Accessibility::SetWinEventHook;
+use windows::Win32::UI::HiDpi::{
+    GetDpiForMonitor, GetDpiForWindow, SetProcessDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, MDT_EFFECTIVE_DPI,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::VK_SHIFT;
 use windows::Win32::UI::WindowsAndMessaging::{
     BringWindowToTop, EnumWindows, FindWindowExW, FindWindowW, GetClassNameW, GetClientRect,
-    GetCursorPos, GetForegroundWindow, GetWindow, GetWindowLongPtrW, GetWindowLongW,
-    GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindow,
-    IsWindowVisible, KillTimer, MessageBoxW, PeekMessageW, PostMessageW, SendMessageTimeoutW,
-    SetForegroundWindow, SetTimer, SetWindowLongPtrW, SetWindowLongW, SystemParametersInfoW,
-    EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE, EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_SHOW,
+    GetCursorPos, GetForegroundWindow, GetSystemMetrics, GetWindow, GetWindowLongPtrW,
+    GetWindowLongW, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
+    IsHungAppWindow, IsIconic, IsWindow, IsWindowVisible, KillTimer, MessageBoxW, PeekMessageW,
+    PostMessageW, SendMessageTimeoutW, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
+    SetWindowLongW, SystemParametersInfoW, EVENT_OBJECT_DESTROY, EVENT_OBJECT_HIDE,
+    EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_SHOW,
     EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND, EVENT_SYSTEM_MINIMIZESTART,
     EVENT_SYSTEM_MOVESIZEEND, GWLP_USERDATA, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, MB_ICONERROR, MB_OK,
-    PM_REMOVE, PW_RENDERFULLCONTENT, SMTO_ABORTIFHUNG, SPIF_SENDCHANGE, SPIF_UPDATEINIFILE,
-    SPI_SETDESKWALLPAPER, SPI_SETFOREGROUNDLOCKTIMEOUT, SW_SHOW,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS,
-    WM_CLIPBOARDUPDATE, WM_CLOSE, WM_DISPLAYCHANGE, WM_ENDSESSION, WM_ERASEBKGND, WM_PAINT,
-    WM_QUERYENDSESSION, WM_TIMER, WM_USER, WS_CHILD,
+    PM_REMOVE, PW_RENDERFULLCONTENT, SMTO_ABORTIFHUNG, SM_CXSCREEN, SM_CYSCREEN, SPIF_SENDCHANGE,
+    SPIF_UPDATEINIFILE, SPI_GETFOREGROUNDLOCKTIMEOUT, SPI_GETWORKAREA, SPI_SETDESKWALLPAPER,
+    SPI_SETFOREGROUNDLOCKTIMEOUT, SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+    WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_CLIPBOARDUPDATE, WM_CLOSE, WM_DISPLAYCHANGE,
+    WM_DPICHANGED, WM_ENDSESSION, WM_ERASEBKGND, WM_PAINT, WM_QUERYENDSESSION, WM_TIMER, WM_USER,
+    WS_CHILD,
 };
+
+// =========================================================================
+// Diagnostics log
+// =========================================================================
+// Release builds are `windows_subsystem = "windows"`, so every `println!` below
+// writes to a console that does not exist, and almost every Win32 call is
+// `let _ = ...`. Without a file log, nothing Astur does — a hook that failed to
+// install, a config line it could not parse, a compositor that fell back — is
+// visible to anyone, and a bug report can only ever be a video.
+//
+// Rules:
+//   * NEVER log from `mouse_proc` / `keyboard_proc`. These take a lock and
+//     allocate; the hooks are on the OS-wide input path (bar-to-hold #2). Hook
+//     health travels through atomics and is logged by the watchdog thread.
+//   * Every macro early-outs on one relaxed atomic load before formatting, so a
+//     `debug!` site costs a load when the level is `error` (the default).
+//   * The queue is bounded and drops oldest-first: a stuck disk must never
+//     block the manager thread.
+
+const LOG_OFF: u8 = 0;
+const LOG_ERROR: u8 = 1;
+const LOG_INFO: u8 = 2;
+const LOG_DEBUG: u8 = 3;
+
+static LOG_LEVEL: AtomicU8 = AtomicU8::new(LOG_OFF);
+static LOGQ: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
+static LOGCV: Condvar = Condvar::new();
+static LOG_DROPPED: AtomicU64 = AtomicU64::new(0);
+static LOG_WORKER: OnceLock<()> = OnceLock::new();
+const LOG_QUEUE_MAX: usize = 1024;
+/// Rotate at 1 MiB into `astur.log.old`. Two files is the whole retention story.
+const LOG_MAX_BYTES: u64 = 1024 * 1024;
+
+fn log_level_from_str(s: &str) -> u8 {
+    match s {
+        "debug" => LOG_DEBUG,
+        "info" => LOG_INFO,
+        "error" => LOG_ERROR,
+        _ => LOG_OFF,
+    }
+}
+
+fn log_level_name(level: u8) -> &'static str {
+    match level {
+        LOG_DEBUG => "debug",
+        LOG_INFO => "info",
+        LOG_ERROR => "error",
+        _ => "off",
+    }
+}
+
+fn log_path() -> std::path::PathBuf {
+    config_path("ASTUR_LOG", "astur.log")
+}
+
+#[inline]
+fn log_on(level: u8) -> bool {
+    LOG_LEVEL.load(Ordering::Relaxed) >= level
+}
+
+fn log_stamp() -> String {
+    let t = unsafe { GetLocalTime() };
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
+        t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, t.wMilliseconds
+    )
+}
+
+/// Queue one line for the writer thread. Called by the manager, the workers and
+/// the main thread — never by a hook.
+fn log_push(level: u8, msg: &str) {
+    if !log_on(level) {
+        return;
+    }
+    let tag = match level {
+        LOG_ERROR => "ERROR",
+        LOG_INFO => "INFO ",
+        _ => "DEBUG",
+    };
+    let line = format!("{} {} {}\r\n", log_stamp(), tag, msg);
+    {
+        let mut q = LOGQ.lock().unwrap_or_else(|p| p.into_inner());
+        if q.len() >= LOG_QUEUE_MAX {
+            q.pop_front();
+            LOG_DROPPED.fetch_add(1, Ordering::Relaxed);
+        }
+        q.push_back(line);
+    }
+    // Spawned on the first line that is actually kept, so `log_level = off`
+    // costs no thread at all.
+    LOG_WORKER.get_or_init(|| {
+        std::thread::spawn(log_worker);
+    });
+    LOGCV.notify_one();
+}
+
+/// Write one line straight to the log file, bypassing the queue. For the panic
+/// hook only: `panic = "abort"` means the worker thread never runs again.
+fn log_sync(msg: &str) {
+    use std::io::Write;
+    let path = log_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = write!(f, "{} ERROR {}\r\n", log_stamp(), msg);
+        let _ = f.flush();
+    }
+}
+
+/// Sole writer. Blocks on the condvar; batches whatever accumulated.
+fn log_worker() {
+    use std::io::Write;
+    let path = log_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    loop {
+        let batch: Vec<String> = {
+            let mut q = LOGQ.lock().unwrap_or_else(|p| p.into_inner());
+            while q.is_empty() {
+                q = LOGCV.wait(q).unwrap_or_else(|p| p.into_inner());
+            }
+            q.drain(..).collect()
+        };
+        let dropped = LOG_DROPPED.swap(0, Ordering::Relaxed);
+        if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > LOG_MAX_BYTES {
+            let _ = std::fs::rename(&path, path.with_extension("log.old"));
+        }
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            if dropped > 0 {
+                let _ = write!(
+                    f,
+                    "{} ERROR log queue full: {dropped} lines dropped\r\n",
+                    log_stamp()
+                );
+            }
+            for line in batch {
+                let _ = f.write_all(line.as_bytes());
+            }
+        }
+    }
+}
+
+macro_rules! log_error {
+    ($($arg:tt)*) => {
+        if log_on(LOG_ERROR) { log_push(LOG_ERROR, &format!($($arg)*)) }
+    };
+}
+macro_rules! log_info {
+    ($($arg:tt)*) => {
+        if log_on(LOG_INFO) { log_push(LOG_INFO, &format!($($arg)*)) }
+    };
+}
+macro_rules! log_debug {
+    ($($arg:tt)*) => {
+        if log_on(LOG_DEBUG) { log_push(LOG_DEBUG, &format!($($arg)*)) }
+    };
+}
+
+// =========================================================================
+// DPI
+// =========================================================================
+// Astur declares per-monitor-v2 awareness in `main()`, so every rect it reads
+// from Win32 and every rect it hands back is in PHYSICAL pixels on the monitor
+// concerned. Before that (<= 2.1.2) Windows virtualised the whole desktop to
+// 96 DPI and tiles landed in the top-left 1/scale of a scaled screen — GitHub
+// issue #5.
+//
+// The consequence is that every pixel in the config is a LOGICAL pixel at 100%
+// and has to be scaled by the DPI of the monitor the chrome is drawn on before
+// it becomes a real pixel. Tiling geometry needs no scaling at all: the work
+// area already arrives in physical pixels.
+//
+// The scaling is applied inside the `bar_*` / `la_*` accessor functions rather
+// than at 60-odd call sites, so a call site cannot forget. Each accessor reads
+// one atomic holding the DPI of the surface currently being drawn:
+//   * `BAR_PAINT_DPI` — set at the top of `paint_bar` from that bar's own
+//     window DPI. All bar painting is on the main thread, one bar at a time.
+//   * `UI_DPI` — set when the launcher or the system menu places itself. Both
+//     are single popups that live on one monitor at a time.
+
+const DPI_BASE: u32 = 96;
+
+/// DPI of the bar currently being painted (96 until the first paint).
+static BAR_PAINT_DPI: AtomicU32 = AtomicU32::new(DPI_BASE);
+/// DPI of the monitor the launcher / system menu was last placed on.
+static UI_DPI: AtomicU32 = AtomicU32::new(DPI_BASE);
+
+/// Scale a configured (logical, 100%) pixel value to physical pixels.
+#[inline]
+fn dpi_px(px: i32, dpi: u32) -> i32 {
+    if dpi == DPI_BASE {
+        return px;
+    }
+    ((px as i64 * dpi as i64) / DPI_BASE as i64) as i32
+}
+
+#[inline]
+fn bar_dpi() -> u32 {
+    BAR_PAINT_DPI.load(Ordering::Relaxed)
+}
+
+#[inline]
+fn ui_dpi() -> u32 {
+    UI_DPI.load(Ordering::Relaxed)
+}
+
+/// Effective DPI of one monitor (96 = 100%). Per-monitor, so a mixed-DPI desk
+/// is handled correctly. Falls back to 96 when the query fails.
+unsafe fn monitor_dpi(hmon: isize) -> u32 {
+    let (mut x, mut y) = (DPI_BASE, DPI_BASE);
+    if GetDpiForMonitor(
+        HMONITOR(hmon as *mut c_void),
+        MDT_EFFECTIVE_DPI,
+        &mut x,
+        &mut y,
+    )
+    .is_err()
+    {
+        return DPI_BASE;
+    }
+    x.max(DPI_BASE)
+}
+
+/// DPI of the monitor a window is on, via the window itself (correct even
+/// mid-move between two monitors of different scale).
+unsafe fn window_dpi(h: HWND) -> u32 {
+    let d = GetDpiForWindow(h);
+    if d == 0 {
+        DPI_BASE
+    } else {
+        d.max(DPI_BASE)
+    }
+}
+
+/// DPI of the monitor under a screen point.
+unsafe fn dpi_at(pt: POINT) -> u32 {
+    monitor_dpi(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST).0 as isize)
+}
 
 // --- tunables -------------------------------------------------------------
 const MIN_W: i32 = 120;
@@ -167,6 +433,14 @@ const RESTORE_DEN: i32 = 2;
 // thickness of each arm (px).
 const MARK_LEN: i32 = 28;
 const MARK_THICK: i32 = 4;
+/// DPI of the monitor the current drag started on. Sampled once at button-down
+/// (never per WM_MOUSEMOVE — the hook is on the OS-wide input path), so the
+/// bracket and the drag outline are the same physical size at every scale.
+static DRAG_DPI: AtomicU32 = AtomicU32::new(DPI_BASE);
+#[inline]
+fn drag_dpi() -> u32 {
+    DRAG_DPI.load(Ordering::Relaxed)
+}
 // Top corners sit on the very top edge; lift the bracket up slightly so it reads
 // as hugging the corner instead of sitting inside the title bar.
 const MARK_TOP_LIFT: i32 = 8;
@@ -242,7 +516,7 @@ unsafe fn show_outline(x: i32, y: i32, w: i32, h: i32) {
         return;
     }
     let hwnd = hwnd_from(raw);
-    let t = OUTLINE_THICK;
+    let t = dpi_px(OUTLINE_THICK, drag_dpi()).max(1);
     let region = CreateRectRgn(0, 0, w, h);
     if w > 2 * t && h > 2 * t {
         let inner = CreateRectRgn(t, t, w - t, h - t);
@@ -548,24 +822,39 @@ unsafe extern "system" fn marker_wndproc(h: HWND, msg: u32, w: WPARAM, l: LPARAM
         }
         return DefWindowProcW(h, msg, w, l);
     }
-    if msg == WM_DISPLAYCHANGE {
+    if msg == WM_DISPLAYCHANGE || msg == WM_DPICHANGED {
         // Reconcile fullscreen monitor handles, reposition/create bars, retile.
+        // A scale change raises WM_DISPLAYCHANGE too, so this one path covers
+        // resolution, monitor add/remove and DPI alike.
         seed_fullscreen_windows();
         ensure_bars();
         push_cmd(Cmd::RefreshMonitors);
     } else if msg == WM_RELOAD {
-        // Config changed: rebuild font + bars (must happen on this thread so it
-        // can't race a paint).
-        make_bar_font(
-            BAR_HEIGHT.load(Ordering::Relaxed) as i32,
-            BAR_FONT_SIZE.load(Ordering::Relaxed) as i32,
-        );
+        // Config changed: drop the per-DPI fonts and rebuild bars (must happen
+        // on this thread so it can't race a paint; they are rebuilt lazily on
+        // the next paint, one per monitor DPI).
+        bar_fonts_clear();
+        bar_icons_clear();
         if BAR_HEIGHT.load(Ordering::Relaxed) > 0 {
             ensure_bars();
         } else {
             for b in BARS.lock().unwrap().iter() {
                 let _ = ShowWindow(hwnd_from(b.hwnd), SW_HIDE);
             }
+        }
+    } else if msg == WM_REARM_HOOKS {
+        // Watchdog says the OS dropped our hooks. Re-install on this thread —
+        // low-level hooks belong to the thread that pumps their messages.
+        let hinst = HINSTANCE(
+            GetModuleHandleW(None)
+                .map(|m| m.0)
+                .unwrap_or(core::ptr::null_mut()),
+        );
+        if install_hooks(hinst) {
+            let n = HOOK_REARMS.fetch_add(1, Ordering::Relaxed) + 1;
+            log_error!("input hooks re-armed (re-arm #{n})");
+        } else {
+            log_error!("input hooks re-arm FAILED; Astur is deaf until restart");
         }
     } else if msg == WM_BAR_MODE_CHANGED {
         // A maximized/fullscreen app entered or left one monitor. Rebuild only
@@ -602,6 +891,7 @@ unsafe fn inject_key(vk: VIRTUAL_KEY, up: bool) {
 /// Alt+Tab is preserved by synthesizing an injected Alt+Tab for the system while
 /// swallowing the physical keys.
 unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    hook_alive_stamp();
     if code == HC_ACTION as i32 {
         let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
         // Let our own synthetic events through — this is how Alt+Tab reaches the
@@ -820,8 +1110,8 @@ unsafe fn set_marker_shape(left: bool, top: bool) {
     if raw == 0 {
         return;
     }
-    let s = MARK_LEN;
-    let t = MARK_THICK;
+    let s = dpi_px(MARK_LEN, drag_dpi());
+    let t = dpi_px(MARK_THICK, drag_dpi()).max(1);
     // Horizontal arm hugs the top or bottom edge; vertical arm the left/right.
     let (hy0, hy1) = if top { (0, t) } else { (s - t, s) };
     let (vx0, vx1) = if left { (0, t) } else { (s - t, s) };
@@ -841,19 +1131,20 @@ unsafe fn show_marker(corner_x: i32, corner_y: i32, left: bool, top: bool) {
     if raw == 0 {
         return;
     }
-    let x = if left { corner_x } else { corner_x - MARK_LEN };
+    let len = dpi_px(MARK_LEN, drag_dpi());
+    let x = if left { corner_x } else { corner_x - len };
     let y = if top {
-        corner_y - MARK_TOP_LIFT
+        corner_y - dpi_px(MARK_TOP_LIFT, drag_dpi())
     } else {
-        corner_y - MARK_LEN
+        corner_y - len
     };
     let _ = SetWindowPos(
         hwnd_from(raw),
         HWND_TOPMOST,
         x,
         y,
-        MARK_LEN,
-        MARK_LEN,
+        len,
+        len,
         SWP_NOACTIVATE | SWP_SHOWWINDOW,
     );
 }
@@ -891,18 +1182,36 @@ unsafe fn work_area_at(pt: POINT) -> RECT {
         ..Default::default()
     };
     if GetMonitorInfoW(mon, &mut mi).as_bool() {
-        mi.rcWork
-    } else {
-        RECT {
-            left: 0,
-            top: 0,
-            right: 1920,
-            bottom: 1080,
-        }
+        return mi.rcWork;
+    }
+    // Fallback: the real primary work area. A hardcoded 1920x1080 was tolerable
+    // while the process was DPI-unaware and every desktop looked like a 96-DPI
+    // one; now that rects are physical it would be actively wrong on a 4K or
+    // scaled screen.
+    let mut wa = RECT::default();
+    if SystemParametersInfoW(
+        SPI_GETWORKAREA,
+        0,
+        Some(&mut wa as *mut RECT as *mut c_void),
+        SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+    )
+    .is_ok()
+        && wa.right > wa.left
+        && wa.bottom > wa.top
+    {
+        return wa;
+    }
+    RECT {
+        left: 0,
+        top: 0,
+        right: GetSystemMetrics(SM_CXSCREEN).max(640),
+        bottom: GetSystemMetrics(SM_CYSCREEN).max(480),
     }
 }
 
 unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // Proof of life for the watchdog. One relaxed store; hook-legal.
+    hook_alive_stamp();
     if code != HC_ACTION as i32 {
         return CallNextHookEx(None, code, wparam, lparam);
     }
@@ -988,11 +1297,20 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
 
     match msg {
         WM_LBUTTONDOWN if left_alt_down() && !drag_active() => {
+            // Sample the scale once per drag; the overlay sizes below read it.
+            DRAG_DPI.store(dpi_at(pt), Ordering::Relaxed);
             if let Some(hwnd) = root_window_at(pt) {
                 let mut rect = RECT::default();
                 if IsZoomed(hwnd).as_bool() {
-                    let _ = ShowWindow(hwnd, SW_RESTORE);
-                    // Shrink to a small floating window centered on the cursor.
+                    // Un-maximize + place is the MANAGER's job. ShowWindow on a
+                    // foreign window drives that process's message loop, and a
+                    // busy app would blow the LowLevelHooksTimeout — at which
+                    // point Windows silently unhooks Astur and every hotkey,
+                    // the launcher and Alt-drag die with no error (review B-02;
+                    // this had regressed after the 2026-07-10 clean-up).
+                    // The hook only predicts the rect (pure arithmetic) and
+                    // seeds the drag from it, so the preview follows the cursor
+                    // from the first WM_MOUSEMOVE.
                     let work = work_area_at(pt);
                     let w = ((work.right - work.left) * RESTORE_NUM / RESTORE_DEN).max(MIN_W);
                     let h = ((work.bottom - work.top) * RESTORE_NUM / RESTORE_DEN).max(MIN_H);
@@ -1000,15 +1318,15 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
                     let mut y = pt.y - h / 2;
                     x = x.clamp(work.left, (work.right - w).max(work.left));
                     y = y.clamp(work.top, (work.bottom - h).max(work.top));
-                    let _ = SetWindowPos(
-                        hwnd,
-                        None,
-                        x,
-                        y,
-                        w,
-                        h,
-                        SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING,
-                    );
+                    push_cmd(Cmd::DragUnmaximize(
+                        hwnd.0 as isize,
+                        RECT {
+                            left: x,
+                            top: y,
+                            right: x + w,
+                            bottom: y + h,
+                        },
+                    ));
                     let mut s = STATE.lock().unwrap();
                     s.mode = Mode::Move;
                     s.hwnd = hwnd.0 as isize;
@@ -1056,6 +1374,7 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
             }
         }
         WM_RBUTTONDOWN if left_alt_down() && !drag_active() => {
+            DRAG_DPI.store(dpi_at(pt), Ordering::Relaxed);
             if let Some(hwnd) = root_window_at(pt) {
                 let mut rect = RECT::default();
                 if GetWindowRect(hwnd, &mut rect).is_ok() {
@@ -1261,20 +1580,29 @@ enum Cmd {
     // SetWindowPos can stall on a busy app) — it previews with an overlay and
     // pushes these; the manager parks/commits the real window.
     DragPark(isize), // thumbnail drag began: park the window off-screen
+    /// Alt+left-drag started on a MAXIMIZED window: un-maximize it and put it
+    /// at the predicted restored rect. `ShowWindow(SW_RESTORE)` drives the
+    /// target's own message loop, so it must never run on the hook.
+    DragUnmaximize(isize, RECT),
     DragMoved(isize, i32, i32, RECT), // dropped after Alt+left-drag: (hwnd, x, y, final rect)
     DragResized(isize, Option<RECT>), // released after resize; None = read the live rect
-    LaunchTerminal,  // Alt+Enter
-    LaunchBrowser,   // Alt+Shift+Enter
-    FocusGeo(Dir),   // Alt+arrow: focus the window in a direction
-    MoveGeo(Dir),    // Alt+Shift+arrow: move the window in a direction
-    FocusMouse(isize), // focus-follows-mouse: cursor hovered this window
-    BarClick(isize, usize), // bar pill clicked: (monitor hmon, local workspace)
-    BarFocus(isize), // bar app-button clicked: focus this window
-    BarCycle(isize, i32), // bar wheel: (monitor hmon, +1 next / -1 prev workspace)
-    Extra(usize),    // compiled extra-hotkey index; strings stay off the hook path
+    LaunchTerminal,                   // Alt+Enter
+    LaunchBrowser,                    // Alt+Shift+Enter
+    FocusGeo(Dir),                    // Alt+arrow: focus the window in a direction
+    MoveGeo(Dir),                     // Alt+Shift+arrow: move the window in a direction
+    FocusMouse(isize),                // focus-follows-mouse: cursor hovered this window
+    BarClick(isize, usize),           // bar pill clicked: (monitor hmon, local workspace)
+    BarFocus(isize),                  // bar app-button clicked: focus this window
+    BarCycle(isize, i32),             // bar wheel: (monitor hmon, +1 next / -1 prev workspace)
+    Extra(usize),                     // compiled extra-hotkey index; strings stay off the hook path
     SetLayout(String),
     ToggleScratchpad,
     Reload(Box<Config>), // config file changed on disk; apply live
+    /// The focused window renamed itself (browser tab, editor file, download
+    /// progress). Nothing to re-tile — the manager loop repaints the bar after
+    /// every command, and `update_bar` only repaints monitors whose data
+    /// actually changed, so coalescing is free.
+    BarRefresh,
 }
 
 static CMDQ: Mutex<VecDeque<Cmd>> = Mutex::new(VecDeque::new());
@@ -1412,6 +1740,14 @@ fn compile_extra_hotkeys(cfg: &Config) -> Vec<ExtraBind> {
 }
 
 fn apply_hook_config(cfg: &Config) {
+    // Every startup and every reload comes through here, so this is the one
+    // place the log level has to be applied.
+    LOG_LEVEL.store(log_level_from_str(&cfg.log_level), Ordering::Relaxed);
+    // Logged at ERROR — the default level — because a key Astur did not
+    // understand is a setting the user believes is in effect and is not.
+    for key in &cfg.unknown_keys {
+        log_error!("config line not understood (ignored): {key}");
+    }
     FOLLOW_MOUSE.store(cfg.focus_follows_mouse, Ordering::Relaxed);
     *IGNORE_CLASSES.lock().unwrap() = cfg.ignore_classes.clone();
     *FLOAT_CLASSES.lock().unwrap() = cfg.float_classes.clone();
@@ -1445,8 +1781,6 @@ static BAR_BOTTOM: AtomicBool = AtomicBool::new(false);
 static BAR_FONT_SIZE: AtomicIsize = AtomicIsize::new(0); // 0 = auto from height
                                                          // Width of each workspace pill in px, and the bar text height, set from config.
 static BAR_CELL: AtomicIsize = AtomicIsize::new(34);
-// Shared font handle for all bars (created once).
-static BAR_FONT: AtomicIsize = AtomicIsize::new(0);
 // Font family name, read on the main thread when (re)building the font.
 static BAR_FONT_NAME: Mutex<String> = Mutex::new(String::new());
 // Horizontal padding from each screen edge (px), read at paint time.
@@ -1485,6 +1819,8 @@ static FULLSCREEN_WINDOWS: Mutex<Option<HashMap<isize, isize>>> = Mutex::new(Non
 // BARS_HOT short-circuits the whole check to one atomic load when idle.
 const MAX_BARS: usize = 8;
 static BARS_HOT: AtomicBool = AtomicBool::new(false);
+/// One-shot guard so an overflowing bar array reports itself exactly once.
+static BARHIT_FULL_LOGGED: AtomicBool = AtomicBool::new(false);
 static BARHIT_HWND: [AtomicIsize; MAX_BARS] = [const { AtomicIsize::new(0) }; MAX_BARS];
 static BARHIT_L: [AtomicI32; MAX_BARS] = [const { AtomicI32::new(0) }; MAX_BARS];
 static BARHIT_T: [AtomicI32; MAX_BARS] = [const { AtomicI32::new(0) }; MAX_BARS];
@@ -1497,7 +1833,15 @@ fn barhit_publish(hwnd: isize, r: Option<RECT>) {
     let slot = (0..MAX_BARS)
         .find(|&i| BARHIT_HWND[i].load(Ordering::Relaxed) == hwnd)
         .or_else(|| (0..MAX_BARS).find(|&i| BARHIT_HWND[i].load(Ordering::Relaxed) == 0));
-    let Some(i) = slot else { return };
+    let Some(i) = slot else {
+        // More than MAX_BARS monitors: this bar silently loses wheel routing.
+        // Rare, but it used to be invisible. Log it once — the fixed array has
+        // to stay (the hook reads it lock-free).
+        if !BARHIT_FULL_LOGGED.swap(true, Ordering::Relaxed) {
+            log_error!("more than {MAX_BARS} bars: wheel routing dropped for bar {hwnd:#x}");
+        }
+        return;
+    };
     match r {
         Some(r) => {
             BARHIT_L[i].store(r.left, Ordering::Relaxed);
@@ -1538,6 +1882,8 @@ struct AhBar {
     y_cur: f64,
     shown: bool,
     strip: RECT,
+    /// Cursor grab tolerance around the bar, physical px on ITS monitor.
+    tol: i32,
 }
 static AH_BARS: Mutex<Option<HashMap<isize, AhBar>>> = Mutex::new(None);
 const AH_TIMER_ID: usize = 4;
@@ -1755,8 +2101,110 @@ const PILL_TIMER_ID: usize = 2;
 // Custom message (to the marker window): config changed, rebuild bars on the
 // main thread.
 const WM_RELOAD: u32 = WM_USER + 2;
+// Custom message (to the marker window): the watchdog believes the low-level
+// hooks are gone. Re-arming must happen on the thread that owns them.
+const WM_REARM_HOOKS: u32 = WM_USER + 6;
 // SetTimer id for the bar clock tick.
 const BAR_TIMER_ID: usize = 1;
+
+// =========================================================================
+// Hook watchdog
+// =========================================================================
+// Windows silently removes a low-level hook whose proc overruns
+// HKEY_CURRENT_USER\Control Panel\Desktop\LowLevelHooksTimeout (300 ms by
+// default). There is no message, no error and no callback: Astur simply
+// becomes a running process that does nothing — Alt-drag, every hotkey, the
+// launcher and the system menu all stop, with no way for the user to tell why.
+// Before this watchdog existed the only recovery was for the user to guess and
+// restart the app (review B-03).
+//
+// The detector is deliberately dumb: the hooks stamp an atomic (a relaxed store
+// of the tick count — no lock, no allocation, hook-legal), and this thread asks
+// the OS when input last happened. Input recently, no callback for a while, and
+// the hooks are gone.
+
+/// Last time either hook proc ran (GetTickCount64 ms).
+static HOOK_TICK: AtomicU64 = AtomicU64::new(0);
+static MOUSE_HOOK_H: AtomicIsize = AtomicIsize::new(0);
+static KBD_HOOK_H: AtomicIsize = AtomicIsize::new(0);
+/// How many times the watchdog has had to put the hooks back. Nonzero here is
+/// the single most useful number in a bug report.
+static HOOK_REARMS: AtomicU32 = AtomicU32::new(0);
+
+/// Input seen this recently counts as "the user is using the machine".
+const WATCHDOG_INPUT_WINDOW_MS: u32 = 2_000;
+/// No hook callback for this long, while input is happening, means unhooked.
+const WATCHDOG_SILENCE_MS: u64 = 5_000;
+
+#[inline]
+fn hook_alive_stamp() {
+    // Cheap enough for the input path: GetTickCount64 reads the shared user
+    // data page, and the store is relaxed.
+    HOOK_TICK.store(unsafe { GetTickCount64() }, Ordering::Relaxed);
+}
+
+/// Install both low-level hooks, replacing any existing ones. Must run on the
+/// thread that pumps messages for them (the main thread).
+unsafe fn install_hooks(hinst: HINSTANCE) -> bool {
+    for slot in [&MOUSE_HOOK_H, &KBD_HOOK_H] {
+        let old = slot.swap(0, Ordering::Relaxed);
+        if old != 0 {
+            let _ = UnhookWindowsHookEx(HHOOK(old as *mut c_void));
+        }
+    }
+    let mouse = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), hinst, 0);
+    let kbd = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), hinst, 0);
+    match (mouse, kbd) {
+        (Ok(m), Ok(k)) => {
+            MOUSE_HOOK_H.store(m.0 as isize, Ordering::Relaxed);
+            KBD_HOOK_H.store(k.0 as isize, Ordering::Relaxed);
+            hook_alive_stamp();
+            true
+        }
+        (m, k) => {
+            // Partial success leaves a half-working WM; drop both.
+            if let Ok(m) = m {
+                let _ = UnhookWindowsHookEx(m);
+            }
+            if let Ok(k) = k {
+                let _ = UnhookWindowsHookEx(k);
+            }
+            false
+        }
+    }
+}
+
+/// Watchdog loop. Cheap: one GetLastInputInfo every 5 s, no locks.
+fn hook_watchdog() {
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(5_000));
+        unsafe {
+            let mut lii = LASTINPUTINFO {
+                cbSize: core::mem::size_of::<LASTINPUTINFO>() as u32,
+                dwTime: 0,
+            };
+            if !GetLastInputInfo(&mut lii).as_bool() {
+                continue;
+            }
+            let idle_ms = GetTickCount().wrapping_sub(lii.dwTime);
+            let silence_ms = GetTickCount64().saturating_sub(HOOK_TICK.load(Ordering::Relaxed));
+            if idle_ms > WATCHDOG_INPUT_WINDOW_MS || silence_ms < WATCHDOG_SILENCE_MS {
+                continue; // either nobody is typing, or the hooks are fine
+            }
+            // Input is happening and neither hook has fired: Windows dropped
+            // them. Re-arm on the owning thread.
+            let marker = MARKER_HWND.load(Ordering::Relaxed);
+            if marker != 0 {
+                log_error!(
+                    "hooks silent for {silence_ms} ms with input {idle_ms} ms ago — re-arming"
+                );
+                let _ = PostMessageW(hwnd_from(marker), WM_REARM_HOOKS, WPARAM(0), LPARAM(0));
+                // Don't re-fire until the re-arm has had a chance to land.
+                hook_alive_stamp();
+            }
+        }
+    }
+}
 
 fn push_cmd(c: Cmd) {
     CMDQ.lock().unwrap().push_back(c);
@@ -1880,6 +2328,71 @@ impl Manager {
             }
         }
         None
+    }
+
+    /// Remove `h` from whichever workspace owns it. Returns where it was and
+    /// whether it was FLOATING there, and repairs that workspace's focus.
+    ///
+    /// This exists because the same three lines were open-coded at five call
+    /// sites, and two of them forgot `floating` — so `Alt+Shift+3` on a floating
+    /// window silently re-tiled it (review B-07). Membership changes go through
+    /// here or through `move_window`; nothing else touches `windows`/`floating`.
+    fn detach_window(&mut self, h: isize) -> Option<(usize, usize, bool)> {
+        let (mi, wi) = self.locate(h)?;
+        let ws = self.monitors.get_mut(mi)?.workspaces.get_mut(wi)?;
+        let was_floating = ws.floating.contains(&h);
+        ws.windows.retain(|&x| x != h);
+        ws.floating.retain(|&x| x != h);
+        if ws.focused == h {
+            ws.focused = ws.windows.first().copied().unwrap_or(0);
+        }
+        Some((mi, wi, was_floating))
+    }
+
+    /// Move `h` to (`to_mi`, `to_wi`), CARRYING its floating flag, and give it
+    /// that workspace's focus. `at` inserts before that tiled index (used when a
+    /// drag is dropped onto a specific window); `None` appends.
+    ///
+    /// Returns false when the window is untracked or the destination does not
+    /// exist — in which case nothing is changed, so a caller can never lose a
+    /// window by moving it somewhere invalid.
+    fn move_window(&mut self, h: isize, to_mi: usize, to_wi: usize, at: Option<usize>) -> bool {
+        if self
+            .monitors
+            .get(to_mi)
+            .and_then(|m| m.workspaces.get(to_wi))
+            .is_none()
+        {
+            return false;
+        }
+        let Some((_, _, was_floating)) = self.detach_window(h) else {
+            return false;
+        };
+        let ws = &mut self.monitors[to_mi].workspaces[to_wi];
+        match at.filter(|&i| i <= ws.windows.len()) {
+            Some(i) => ws.windows.insert(i, h),
+            None => ws.windows.push(h),
+        }
+        if was_floating {
+            ws.floating.push(h);
+        }
+        ws.focused = h;
+        true
+    }
+
+    /// The focused window of the focused monitor's active workspace (0 = none),
+    /// with its (monitor, workspace) — the `mi`/`a`/`focused` dance that was
+    /// repeated ~20 times.
+    fn focused(&self) -> (usize, usize, isize) {
+        let mi = self.focused_mon.min(self.monitors.len().saturating_sub(1));
+        let a = self.monitors.get(mi).map(|m| m.active).unwrap_or(0);
+        let h = self
+            .monitors
+            .get(mi)
+            .and_then(|m| m.workspaces.get(a))
+            .map(|ws| ws.focused)
+            .unwrap_or(0);
+        (mi, a, h)
     }
 }
 
@@ -2312,6 +2825,14 @@ fn distribute_workspaces(
             let extra = m.workspaces.pop().unwrap();
             m.workspaces[0].windows.extend(extra.windows);
             m.workspaces[0].floating.extend(extra.floating);
+            // Carry the focus too when workspace 0 has none, or the folded
+            // windows arrive with focus pointing at whatever happened to be
+            // first (review B-14). `splits` is deliberately NOT carried: those
+            // ratios describe a different set of tiled windows and would place
+            // the merged set wrongly.
+            if m.workspaces[0].focused == 0 {
+                m.workspaces[0].focused = extra.focused;
+            }
         }
         if m.active >= m.workspaces.len() {
             m.active = 0;
@@ -2329,18 +2850,34 @@ unsafe fn reserve_bar(monitors: &mut [Monitor], cfg: &Config) {
         // bar reserves its height plus the margin on both sides so tiles clear
         // the detached pill.
         if cfg.bar_enabled && cfg.bar_height > 0 && !cfg.bar_autohide {
-            let extra = if cfg.bar_floating {
-                cfg.bar_margin * 2
-            } else {
-                0
-            };
+            // Physical px on THIS monitor. Must match what ensure_bars actually
+            // places, or every tile on a scaled screen is offset by the
+            // difference — hence the shared helper.
+            let reserved = bar_reserved_px(
+                cfg.bar_height,
+                cfg.bar_floating,
+                cfg.bar_margin,
+                monitor_dpi(m.hmon),
+            );
             if cfg.bar_bottom {
-                m.work_area.bottom -= cfg.bar_height + extra;
+                m.work_area.bottom -= reserved;
             } else {
-                m.work_area.top += cfg.bar_height + extra;
+                m.work_area.top += reserved;
             }
         }
     }
+}
+
+/// Vertical space one bar occupies on a monitor of `dpi`, in physical pixels.
+/// The single source of truth shared by `reserve_bar` (what tiling leaves free)
+/// and `ensure_bars` (where the window is actually put).
+fn bar_reserved_px(height_logical: i32, floating: bool, margin_logical: i32, dpi: u32) -> i32 {
+    dpi_px(height_logical, dpi)
+        + if floating {
+            dpi_px(margin_logical, dpi) * 2
+        } else {
+            0
+        }
 }
 
 /// Resolve which managed monitor a window currently sits on.
@@ -2457,7 +2994,7 @@ fn hex_encode(value: &str) -> String {
 }
 
 fn hex_decode(value: &str) -> Option<String> {
-    if value.len() % 2 != 0 {
+    if !value.len().is_multiple_of(2) {
         return None;
     }
     let bytes: Option<Vec<u8>> = (0..value.len())
@@ -2581,7 +3118,7 @@ fn launcher_mru_bump(key: &str) {
             .iter()
             .map(|(key, tick)| (*tick, hex_encode(key)))
             .collect();
-        rows.sort_by(|a, b| b.0.cmp(&a.0));
+        rows.sort_by_key(|r| std::cmp::Reverse(r.0));
         rows.truncate(200);
         rows.into_iter()
             .map(|(tick, key)| format!("{tick}|{key}"))
@@ -2611,6 +3148,69 @@ fn mru_worker() {
         let _ = std::fs::write(path, text);
     }
 }
+/// A security descriptor granting full access to the current user's SID and
+/// nobody else, for the IPC pipe. Leaked deliberately: it lives for the process
+/// lifetime and is handed to CreateNamedPipeW on every accept loop iteration.
+/// Returns None if anything fails, in which case the caller falls back to the
+/// default DACL (which is what shipped before).
+unsafe fn owner_only_security_descriptor() -> Option<*mut c_void> {
+    static SD: OnceLock<usize> = OnceLock::new();
+    let value = *SD.get_or_init(|| {
+        // Own SID, as a string, straight from the process token.
+        let mut token = HANDLE::default();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
+            return 0;
+        }
+        let mut len = 0u32;
+        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut len);
+        let mut buf = vec![0u8; len as usize];
+        let ok = len > 0
+            && GetTokenInformation(
+                token,
+                TokenUser,
+                Some(buf.as_mut_ptr() as *mut c_void),
+                len,
+                &mut len,
+            )
+            .is_ok();
+        let sid_string = ok
+            .then(|| {
+                let user = &*(buf.as_ptr() as *const TOKEN_USER);
+                let mut out = windows::core::PWSTR::null();
+                ConvertSidToStringSidW(user.User.Sid, &mut out)
+                    .ok()
+                    .map(|_| {
+                        let s = out.to_string().unwrap_or_default();
+                        let _ = LocalFree(HLOCAL(out.0 as *mut c_void));
+                        s
+                    })
+            })
+            .flatten();
+        let _ = CloseHandle(token);
+        let Some(sid) = sid_string.filter(|s| !s.is_empty()) else {
+            return 0;
+        };
+        // D: = DACL, A = allow, GA = generic all, for that SID only.
+        let sddl: Vec<u16> = format!("D:(A;;GA;;;{sid})")
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut psd = PSECURITY_DESCRIPTOR::default();
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl.as_ptr()),
+            SDDL_REVISION_1,
+            &mut psd,
+            None,
+        )
+        .is_err()
+        {
+            return 0;
+        }
+        psd.0 as usize
+    });
+    (value != 0).then_some(value as *mut c_void)
+}
+
 unsafe fn ipc_dispatch(line: &str) -> String {
     let line = line.trim();
     let mut parts = line.split_whitespace();
@@ -2650,7 +3250,25 @@ unsafe fn ipc_dispatch(line: &str) -> String {
         "launcher" => open_launcher_popup(),
         "system_menu" => open_system_popup(),
         "reload" => reload_config_now(),
-        "launch" if !argument.is_empty() => launch(&argument),
+        // Arbitrary exec is opt-in. Astur can otherwise be used as a
+        // convenient parent process by anything already running as the user
+        // (review S-02). Window-management verbs above are always available.
+        "launch" if !argument.is_empty() => {
+            if !UI_CFG
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|c| c.ipc_allow_launch)
+                .unwrap_or(false)
+            {
+                log_error!("IPC launch refused (ipc_allow_launch = false): {argument}");
+                return "error launch is disabled (set ipc_allow_launch = true)
+"
+                .to_string();
+            }
+            log_info!("IPC launch: {argument}");
+            launch(&argument);
+        }
         "status" => {
             return format!(
                 "ok windows={} launcher={} system_menu={}\n",
@@ -2669,15 +3287,29 @@ unsafe fn ipc_dispatch(line: &str) -> String {
 
 fn ipc_worker() {
     loop {
+        // Cheap check first. IPC is off by default, and this used to deep-clone
+        // the whole Config every 500 ms forever just to read one bool — pure
+        // waste on an idle desktop (review P-07).
+        let enabled = UI_CFG
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|c| c.ipc_enabled)
+            .unwrap_or(false);
+        if !enabled {
+            // Sleep on the reload condvar instead of polling: a config change
+            // wakes us immediately, and an idle desktop costs nothing at all.
+            let guard = IPC_WAKE.0.lock().unwrap();
+            let _ = IPC_WAKE
+                .1
+                .wait_timeout(guard, std::time::Duration::from_secs(30));
+            continue;
+        }
         let cfg = UI_CFG
             .lock()
             .unwrap()
             .clone()
             .unwrap_or_else(Config::defaults);
-        if !cfg.ipc_enabled {
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            continue;
-        }
         let clean: String = cfg
             .ipc_pipe
             .chars()
@@ -2691,6 +3323,15 @@ fn ipc_worker() {
         let path = format!(r"\\.\pipe\{name}");
         let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
         unsafe {
+            // Explicit DACL: only this user account. The default (NULL) SD is
+            // already restrictive in practice, but "in practice" is not a
+            // security property — say what is allowed (review S-02).
+            let sd = owner_only_security_descriptor();
+            let sa = sd.map(|sd| SECURITY_ATTRIBUTES {
+                nLength: core::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: sd,
+                bInheritHandle: BOOL(0),
+            });
             let pipe = CreateNamedPipeW(
                 PCWSTR(wide.as_ptr()),
                 PIPE_ACCESS_DUPLEX,
@@ -2699,7 +3340,7 @@ fn ipc_worker() {
                 4096,
                 4096,
                 0,
-                None,
+                sa.as_ref().map(|sa| sa as *const SECURITY_ATTRIBUTES),
             );
             if pipe == INVALID_HANDLE_VALUE {
                 std::thread::sleep(std::time::Duration::from_secs(1));
@@ -2728,6 +3369,31 @@ fn ipc_worker() {
 /// Reveal + un-style a specific list of window handles. Takes the list by ref so
 /// callers control how they acquire it (the panic path must not re-lock a mutex
 /// it may already hold — see `restore_on_panic`).
+/// Undo Astur's per-window styling: full opacity, default border, and — the bit
+/// that used to be missed — REMOVE the `WS_EX_LAYERED` bit we added.
+///
+/// Setting alpha back to 255 is not enough. A layered window stays layered for
+/// the rest of its life, on a separate composition path, even after Astur exits
+/// (review B-16). `unfocused_opacity` defaults to 0.8, so this applied to every
+/// window Astur ever dimmed.
+unsafe fn unstyle_window(hwnd: HWND) {
+    if !IsWindow(hwnd).as_bool() {
+        return;
+    }
+    let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
+    let ex = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+    if ex & WS_EX_LAYERED.0 != 0 {
+        SetWindowLongW(hwnd, GWL_EXSTYLE, (ex & !WS_EX_LAYERED.0) as i32);
+    }
+    let def: u32 = 0xFFFFFFFF; // DWMWA_COLOR_DEFAULT
+    let _ = DwmSetWindowAttribute(
+        hwnd,
+        DWMWA_BORDER_COLOR,
+        &def as *const _ as *const c_void,
+        core::mem::size_of::<u32>() as u32,
+    );
+}
+
 unsafe fn restore_windows(list: &[isize]) {
     SUPPRESS.store(true, Ordering::Relaxed);
     for &h in list {
@@ -2737,15 +3403,8 @@ unsafe fn restore_windows(list: &[isize]) {
         }
         unmark_hidden_by_us(h);
         let _ = ShowWindow(hwnd, SW_SHOW);
-        // Undo any dimming and restore the default border. Positions untouched.
-        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
-        let def: u32 = 0xFFFFFFFF; // DWMWA_COLOR_DEFAULT
-        let _ = DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_BORDER_COLOR,
-            &def as *const _ as *const c_void,
-            core::mem::size_of::<u32>() as u32,
-        );
+        // Undo dimming, the layered style and the border. Positions untouched.
+        unstyle_window(hwnd);
     }
     SUPPRESS.store(false, Ordering::Relaxed);
 }
@@ -2755,6 +3414,10 @@ unsafe fn restore_all_windows() {
     restore_windows(&list);
     // Everything is visible again — nothing left for the crash-rescue pass.
     let _ = std::fs::remove_file(rescue_file());
+    // Every graceful exit route funnels through here (tray Quit, Ctrl+C, End
+    // task, logoff, the panic hook), so it is also where the system-wide
+    // foreground-lock setting goes back to what the user had.
+    restore_foreground_lock();
 }
 
 /// Panic-path restore: a thread panic with `panic = "abort"` runs the panic hook
@@ -3147,6 +3810,21 @@ unsafe fn focus_window(h: isize) {
     let fg = GetForegroundWindow();
     let cur = GetCurrentThreadId();
     let fgt = GetWindowThreadProcessId(fg, None);
+    // AttachThreadInput joins two threads' input queues and can block when the
+    // other thread is not pumping messages — with no timeout. This runs on the
+    // manager thread, which owns ALL window state, so one hung app would stall
+    // every workspace switch, hotkey and retile behind it (review B-12).
+    // Skipping the attach costs at worst a focus that does not take; blocking
+    // costs the whole WM.
+    if !fg.0.is_null() && IsHungAppWindow(fg).as_bool() {
+        log_error!(
+            "skipped focus attach: foreground window {:#x} is not responding",
+            fg.0 as isize
+        );
+        let _ = SetForegroundWindow(hwnd);
+        let _ = BringWindowToTop(hwnd);
+        return;
+    }
     if fgt != 0 && fgt != cur {
         let _ = AttachThreadInput(cur, fgt, BOOL(1));
         let _ = SetForegroundWindow(hwnd);
@@ -3324,7 +4002,7 @@ unsafe fn capture_wallpaper(work_area: RECT) -> isize {
     let src = wallpaper_window();
     if src.0.is_null() {
         if !WP_DIAG.swap(true, Ordering::Relaxed) {
-            eprintln!("[Astur] wallpaper: no Progman/WorkerW found -> flat slide");
+            log_info!("wallpaper: no Progman/WorkerW found -> flat slide");
         }
         return 0;
     }
@@ -3373,7 +4051,7 @@ unsafe fn capture_wallpaper(work_area: RECT) -> isize {
         let mut buf = [0u16; 64];
         let n = GetClassNameW(src, &mut buf);
         let class = String::from_utf16_lossy(&buf[..n as usize]);
-        eprintln!("[Astur] wallpaper source class '{class}', PrintWindow={printed}, ok={ok}");
+        log_info!("wallpaper source class '{class}', PrintWindow={printed}, ok={ok}");
     }
     if !ok {
         let _ = DeleteObject(HGDIOBJ(resbmp.0));
@@ -3939,16 +4617,15 @@ unsafe fn switch_plain(mgr: &mut Manager, mi: usize, old: usize, n: usize) {
     // EVENT_OBJECT_HIDE can never race the marker (see the static's comment).
     {
         let ws = &mgr.monitors[mi].workspaces[old].windows;
-        for i in 0..ws.len() {
-            mark_hidden_by_us(ws[i]);
-            let _ = ShowWindow(hwnd_from(ws[i]), SW_HIDE);
+        for &h in ws.iter() {
+            mark_hidden_by_us(h);
+            let _ = ShowWindow(hwnd_from(h), SW_HIDE);
         }
     }
     mgr.monitors[mi].active = n;
     {
         let ws = &mgr.monitors[mi].workspaces[n].windows;
-        for i in 0..ws.len() {
-            let h = ws[i];
+        for &h in ws.iter() {
             if h == SCRATCHPAD_HWND.load(Ordering::Relaxed)
                 && SCRATCHPAD_HIDDEN.load(Ordering::Relaxed)
             {
@@ -4614,15 +5291,7 @@ unsafe fn process(mgr: &mut Manager, cmd: Cmd) {
             for m in &mgr.monitors {
                 for ws in &m.workspaces {
                     for &h in &ws.windows {
-                        let hwnd = hwnd_from(h);
-                        let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA);
-                        let def: u32 = 0xFFFFFFFF; // DWMWA_COLOR_DEFAULT
-                        let _ = DwmSetWindowAttribute(
-                            hwnd,
-                            DWMWA_BORDER_COLOR,
-                            &def as *const _ as *const c_void,
-                            core::mem::size_of::<u32>() as u32,
-                        );
+                        unstyle_window(hwnd_from(h));
                     }
                 }
             }
@@ -4760,14 +5429,11 @@ unsafe fn process(mgr: &mut Manager, cmd: Cmd) {
             if to_mi == from_mi && to_local == from_a {
                 return;
             }
-            {
-                let ws = &mut mgr.monitors[from_mi].workspaces[from_a];
-                ws.windows.retain(|&x| x != h);
-                ws.floating.retain(|&x| x != h);
-                ws.focused = ws.windows.first().copied().unwrap_or(0);
+            // Carries the floating flag: sending a floated window to another
+            // workspace used to silently re-tile it (review B-07).
+            if !mgr.move_window(h, to_mi, to_local, None) {
+                return;
             }
-            mgr.monitors[to_mi].workspaces[to_local].windows.push(h);
-            mgr.monitors[to_mi].workspaces[to_local].focused = h;
             retile_monitor(mgr, from_mi);
             // Follow the window: show its destination workspace, focus it, warp.
             mgr.focused_mon = to_mi;
@@ -4799,9 +5465,7 @@ unsafe fn process(mgr: &mut Manager, cmd: Cmd) {
             if !mgr.tiling {
                 return;
             }
-            let mi = mgr.focused_mon;
-            let a = mgr.monitors[mi].active;
-            let h = mgr.monitors[mi].workspaces[a].focused;
+            let (mi, a, h) = mgr.focused();
             if h == 0 {
                 return;
             }
@@ -4814,15 +5478,29 @@ unsafe fn process(mgr: &mut Manager, cmd: Cmd) {
             retile_monitor(mgr, mi);
         }
         Cmd::CloseFocused => {
-            let mi = mgr.focused_mon;
-            let a = mgr.monitors[mi].active;
-            let h = mgr.monitors[mi].workspaces[a].focused;
+            let (_, _, h) = mgr.focused();
             if h != 0 {
                 let _ = PostMessageW(hwnd_from(h), WM_CLOSE, WPARAM(0), LPARAM(0));
             }
         }
+        Cmd::BarRefresh => {} // the loop's update_bar does the work
         Cmd::Retile => retile_all(mgr),
         Cmd::RefreshMonitors => refresh_monitors(mgr),
+        Cmd::DragUnmaximize(h, r) => {
+            // The hook predicted this rect; do the parts that can block here.
+            let hwnd = hwnd_from(h);
+            if IsWindow(hwnd).as_bool() {
+                let _ = ShowWindow(hwnd, SW_RESTORE);
+                commit_rect(h, r.left, r.top, r.right - r.left, r.bottom - r.top);
+                log_debug!(
+                    "DragUnmaximize {h:#x} -> {},{} {}x{}",
+                    r.left,
+                    r.top,
+                    r.right - r.left,
+                    r.bottom - r.top
+                );
+            }
+        }
         Cmd::DragPark(h) => {
             // Thumbnail drag began: park the real window far off-screen (size kept)
             // so the user sees only the live DWM mirror. Off-screen, NOT SW_HIDE — a
@@ -4852,11 +5530,22 @@ unsafe fn process(mgr: &mut Manager, cmd: Cmd) {
             let Some((from_mi, from_wi)) = mgr.locate(h) else {
                 return;
             };
-            // Floating windows are left wherever the user dropped them.
+            // Floating windows keep the rect the user dropped them at — but if
+            // that was on ANOTHER monitor they must change owner, or switching
+            // workspaces on the old monitor SW_HIDEs a window the user is
+            // looking at on the new one (review B-06).
             if mgr.monitors[from_mi].workspaces[from_wi]
                 .floating
                 .contains(&h)
             {
+                let to_mi = monitor_index_for_point(mgr, POINT { x, y });
+                if to_mi != from_mi {
+                    let to_a = mgr.monitors[to_mi].active;
+                    if mgr.move_window(h, to_mi, to_a, None) {
+                        mgr.focused_mon = to_mi;
+                        log_debug!("floating window {h:#x} re-homed {from_mi} -> {to_mi}");
+                    }
+                }
                 return;
             }
             let from_a = mgr.monitors[from_mi].active;
@@ -4879,20 +5568,18 @@ unsafe fn process(mgr: &mut Manager, cmd: Cmd) {
                 mgr.monitors[from_mi].workspaces[from_a].focused = h;
                 retile_monitor(mgr, from_mi);
             } else {
-                // Move the window to the monitor it was dropped on.
-                {
-                    let ws = &mut mgr.monitors[from_mi].workspaces[from_a];
-                    ws.windows.retain(|&w| w != h);
-                    ws.floating.retain(|&w| w != h);
-                    ws.focused = ws.windows.first().copied().unwrap_or(0);
-                }
+                // Move the window to the monitor it was dropped on, landing it
+                // where it was dropped in the tiled order.
                 let to_a = mgr.monitors[to_mi].active;
-                let ws = &mut mgr.monitors[to_mi].workspaces[to_a];
-                match target.and_then(|t| ws.windows.iter().position(|&w| w == t)) {
-                    Some(pos) => ws.windows.insert(pos, h),
-                    None => ws.windows.push(h),
+                let at = target.and_then(|t| {
+                    mgr.monitors[to_mi].workspaces[to_a]
+                        .windows
+                        .iter()
+                        .position(|&w| w == t)
+                });
+                if !mgr.move_window(h, to_mi, to_a, at) {
+                    return;
                 }
-                ws.focused = h;
                 mgr.focused_mon = to_mi;
                 retile_monitor(mgr, from_mi);
                 retile_monitor(mgr, to_mi);
@@ -5026,9 +5713,7 @@ unsafe fn process(mgr: &mut Manager, cmd: Cmd) {
             if !mgr.tiling || mgr.monitors.is_empty() {
                 return;
             }
-            let mi = mgr.focused_mon;
-            let a = mgr.monitors[mi].active;
-            let h = mgr.monitors[mi].workspaces[a].focused;
+            let (mi, a, h) = mgr.focused();
             if h == 0 {
                 return;
             }
@@ -5054,15 +5739,10 @@ unsafe fn process(mgr: &mut Manager, cmd: Cmd) {
                 }
             } else if let Some(to_mi) = adjacent_monitor(mgr, mi, dir) {
                 // Move the window to the adjacent monitor's active workspace.
-                {
-                    let ws = &mut mgr.monitors[mi].workspaces[a];
-                    ws.windows.retain(|&w| w != h);
-                    ws.floating.retain(|&w| w != h);
-                    ws.focused = ws.windows.first().copied().unwrap_or(0);
-                }
                 let ta = mgr.monitors[to_mi].active;
-                mgr.monitors[to_mi].workspaces[ta].windows.push(h);
-                mgr.monitors[to_mi].workspaces[ta].focused = h;
+                if !mgr.move_window(h, to_mi, ta, None) {
+                    return;
+                }
                 mgr.focused_mon = to_mi;
                 retile_monitor(mgr, mi);
                 retile_monitor(mgr, to_mi);
@@ -5104,14 +5784,55 @@ unsafe extern "system" fn bar_mon_enum(
     BOOL(1)
 }
 
-/// Build the shared bar font and pill-cell width. Call only on the main thread
-/// (the bars' paint thread) so deleting the old font can't race a paint.
-unsafe fn make_bar_font(height: i32, font_size: i32) {
-    let size = if font_size > 0 {
-        font_size
-    } else {
-        ((height as f32) * 0.5) as i32
+/// Bar fonts, one per distinct monitor DPI. A single shared HFONT cannot serve
+/// a mixed-DPI desk: the same `bar_font_size` has to become more physical
+/// pixels on the 150% screen than on the 100% one, and GDI does not rescale a
+/// font for us.
+static BAR_FONTS: Mutex<Option<HashMap<u32, isize>>> = Mutex::new(None);
+
+/// Drop every cached bar font. Main thread only (the bars' paint thread), so
+/// deleting cannot race a paint. Call whenever the font config changes.
+unsafe fn bar_fonts_clear() {
+    if let Some(map) = BAR_FONTS.lock().unwrap().take() {
+        for (_, f) in map {
+            let _ = DeleteObject(HGDIOBJ(f as *mut c_void));
+        }
     }
+}
+
+/// The bar font for one monitor DPI, built on first use. Main thread only.
+unsafe fn bar_font_for(dpi: u32) -> isize {
+    if let Some(f) = BAR_FONTS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|m| m.get(&dpi).copied())
+    {
+        return f;
+    }
+    let f = make_bar_font(
+        BAR_HEIGHT.load(Ordering::Relaxed) as i32,
+        BAR_FONT_SIZE.load(Ordering::Relaxed) as i32,
+        dpi,
+    );
+    BAR_FONTS
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .insert(dpi, f);
+    f
+}
+
+/// Build one bar font at `dpi`. `height`/`font_size` are logical (100%) px.
+unsafe fn make_bar_font(height: i32, font_size: i32, dpi: u32) -> isize {
+    let size = dpi_px(
+        if font_size > 0 {
+            font_size
+        } else {
+            ((height as f32) * 0.5) as i32
+        },
+        dpi,
+    )
     .max(8);
     // Null-terminated face name; kept alive for the duration of the call.
     let name = {
@@ -5140,11 +5861,11 @@ unsafe fn make_bar_font(height: i32, font_size: i32) {
         0, // DEFAULT_PITCH | FF_DONTCARE
         PCWSTR(wname.as_ptr()),
     );
-    let prev = BAR_FONT.swap(f.0 as isize, Ordering::Relaxed);
-    if prev != 0 {
-        let _ = DeleteObject(HGDIOBJ(prev as *mut c_void));
-    }
-    BAR_CELL.store((height.max(8) as f32 * 1.25) as isize, Ordering::Relaxed);
+    // NOTE: this used to also store BAR_CELL = height * 1.25, which ran after
+    // apply_bar_statics on every startup and reload and therefore silently
+    // discarded the documented `workspace_width` setting. BAR_CELL is config,
+    // not a font metric — leave it alone.
+    f.0 as isize
 }
 
 /// Create or reposition one bar window per monitor. Safe to call repeatedly
@@ -5162,7 +5883,9 @@ unsafe fn bar_autohide_tick(h: HWND) {
         return;
     };
     let yc = ab.y_cur as i32;
-    let over_bar = pt.x >= ab.x && pt.x < ab.x + ab.w && pt.y >= yc - 8 && pt.y < yc + ab.h + 8;
+    // Grab tolerance above/below the bar, in physical px for that monitor.
+    let tol = ab.tol;
+    let over_bar = pt.x >= ab.x && pt.x < ab.x + ab.w && pt.y >= yc - tol && pt.y < yc + ab.h + tol;
     let in_strip = pt.x >= ab.strip.left
         && pt.x < ab.strip.right
         && pt.y >= ab.strip.top
@@ -5199,23 +5922,26 @@ unsafe fn bar_autohide_tick(h: HWND) {
 }
 
 unsafe fn ensure_bars() {
-    let height = BAR_HEIGHT.load(Ordering::Relaxed) as i32;
-    if height <= 0 {
+    // Logical (100%) values straight from the config; each monitor scales them
+    // by its own DPI below, so a mixed-DPI desk gets a correctly sized bar on
+    // both screens.
+    let height_logical = BAR_HEIGHT.load(Ordering::Relaxed) as i32;
+    if height_logical <= 0 {
         // Bar disabled: silence the hook's wheel routing.
-        for i in 0..MAX_BARS {
-            BARHIT_HWND[i].store(0, Ordering::Relaxed);
+        for slot in BARHIT_HWND.iter() {
+            slot.store(0, Ordering::Relaxed);
         }
         BARS_HOT.store(false, Ordering::Relaxed);
         return;
     }
     let bottom = BAR_BOTTOM.load(Ordering::Relaxed);
     let floating = BAR_FLOATING.load(Ordering::Relaxed);
-    let margin = if floating {
+    let margin_logical = if floating {
         BAR_MARGIN.load(Ordering::Relaxed) as i32
     } else {
         0
     };
-    let radius = BAR_RADIUS.load(Ordering::Relaxed) as i32;
+    let radius_logical = BAR_RADIUS.load(Ordering::Relaxed) as i32;
     let hinst = HINSTANCE(BAR_HINST.load(Ordering::Relaxed) as *mut c_void);
 
     let mut raw: Vec<(isize, RECT)> = Vec::new();
@@ -5230,6 +5956,14 @@ unsafe fn ensure_bars() {
     for &(hmon, rcm) in &raw {
         // Configured auto-hide stays global. Fullscreen override is per monitor.
         let autohide = BAR_AUTOHIDE.load(Ordering::Relaxed) || monitor_has_fullscreen(hmon);
+        // Physical px for THIS monitor. reserve_bar computes the same number
+        // from the same inputs; if these two ever diverge, every tile on a
+        // scaled screen is offset by the difference.
+        let dpi = monitor_dpi(hmon);
+        let height = dpi_px(height_logical, dpi);
+        let margin = dpi_px(margin_logical, dpi);
+        let radius = dpi_px(radius_logical, dpi);
+        let edge = dpi_px(2, dpi).max(1); // auto-hide reveal band / hidden overshoot
         let x = rcm.left + margin;
         let w = (rcm.right - rcm.left) - margin * 2;
         let y = if bottom {
@@ -5297,7 +6031,7 @@ unsafe fn ensure_bars() {
             let strip = if bottom {
                 RECT {
                     left: rcm.left,
-                    top: rcm.bottom - 2,
+                    top: rcm.bottom - edge,
                     right: rcm.right,
                     bottom: rcm.bottom,
                 }
@@ -5306,13 +6040,13 @@ unsafe fn ensure_bars() {
                     left: rcm.left,
                     top: rcm.top,
                     right: rcm.right,
-                    bottom: rcm.top + 2,
+                    bottom: rcm.top + edge,
                 }
             };
             let y_hidden = if bottom {
-                rcm.bottom + 2
+                rcm.bottom + edge
             } else {
-                rcm.top - height - 2
+                rcm.top - height - edge
             };
             let key = hb.0 as isize;
             let (y_cur, shown) = {
@@ -5327,6 +6061,7 @@ unsafe fn ensure_bars() {
                     y_cur: y as f64,
                     shown: true,
                     strip,
+                    tol: dpi_px(8, dpi),
                 });
                 // Preserve slide progress when another monitor changes mode or
                 // config/display geometry rebuilds bars.
@@ -5343,6 +6078,7 @@ unsafe fn ensure_bars() {
                 state.y_hidden = y_hidden;
                 state.y_cur = y as f64 + progress * (y_hidden - y) as f64;
                 state.strip = strip;
+                state.tol = dpi_px(8, dpi);
                 (state.y_cur.round() as i32, state.shown)
             };
             // ensure_bars first places existing windows at shown geometry; restore
@@ -5447,14 +6183,31 @@ fn format_date(fmt: &str, st: &SYSTEMTIME) -> String {
 const DEFAULT_BAR_ICON_PX: i32 = 20;
 static BAR_ICON_PX_CFG: AtomicI32 = AtomicI32::new(DEFAULT_BAR_ICON_PX);
 static BAR_WIDGET_GAP_CFG: AtomicI32 = AtomicI32::new(16);
-static BAR_ICONS: Mutex<Option<HashMap<String, isize>>> = Mutex::new(None);
+/// Keyed on (exe path, pixel size). Keying on the path alone meant a size
+/// change in the settings GUI kept the old icons until restart, and — once
+/// per-monitor DPI arrived — that a 100% and a 150% monitor would share one
+/// bitmap (see review B-09).
+static BAR_ICONS: Mutex<Option<HashMap<(String, i32), isize>>> = Mutex::new(None);
+
+/// Drop every cached bar icon and release its HICON. Main thread only.
+unsafe fn bar_icons_clear() {
+    if let Some(map) = BAR_ICONS.lock().unwrap().take() {
+        for (_, icon) in map {
+            if icon > 0 {
+                release_launcher_icon(icon);
+            }
+        }
+    }
+}
+
+/// Icon box for the bar currently being painted, in physical px.
 #[inline]
 fn bar_icon_px() -> i32 {
-    BAR_ICON_PX_CFG.load(Ordering::Relaxed)
+    dpi_px(BAR_ICON_PX_CFG.load(Ordering::Relaxed), bar_dpi())
 }
 #[inline]
 fn bar_widget_gap() -> i32 {
-    BAR_WIDGET_GAP_CFG.load(Ordering::Relaxed)
+    dpi_px(BAR_WIDGET_GAP_CFG.load(Ordering::Relaxed), bar_dpi())
 }
 
 /// Full exe path of a window's process (for the app-buttons icon cache key).
@@ -5480,19 +6233,23 @@ unsafe fn window_exe(hwnd: HWND) -> Option<String> {
 
 /// Return cached app icon without shell work on manager thread. Cache misses are
 /// queued to icon workers and temporarily render a placeholder.
-unsafe fn bar_app_icon(hwnd: HWND) -> isize {
+/// `px` is the physical size the caller will draw at — icons are resolved at
+/// exactly that size and never rescaled in DrawIconEx (see
+/// plan/known-issues.md 2026-07-10), so it is part of the cache key.
+unsafe fn bar_app_icon(hwnd: HWND, px: i32) -> isize {
     let Some(path) = window_exe(hwnd) else {
         return -1;
     };
+    let key = (path.clone(), px);
     {
         let mut cache = BAR_ICONS.lock().unwrap();
         let map = cache.get_or_insert_with(HashMap::new);
-        if let Some(&icon) = map.get(&path) {
+        if let Some(&icon) = map.get(&key) {
             return icon;
         }
-        map.insert(path.clone(), 0);
+        map.insert(key, 0);
     }
-    let job = IconJob::Bar(path);
+    let job = IconJob::Bar(path, px);
     let mut q = ICON_QUEUE.lock().unwrap();
     if !q.contains(&job) {
         q.push_back(job);
@@ -5778,7 +6535,10 @@ unsafe fn update_bar(mgr: &Manager) {
             String::new()
         };
         // App buttons: the active workspace's windows with their exe icons
-        // (cached per exe, so this is a HashMap hit after the first sighting).
+        // (cached per (exe, size), so this is a HashMap hit after the first
+        // sighting). Resolved at THIS monitor's physical icon size — the
+        // manager thread cannot read the paint-time DPI.
+        let icon_px = dpi_px(BAR_ICON_PX_CFG.load(Ordering::Relaxed), monitor_dpi(m.hmon));
         let apps: Vec<BarApp> = if mgr.cfg.bar_show_apps {
             m.workspaces
                 .get(m.active)
@@ -5798,7 +6558,7 @@ unsafe fn update_bar(mgr: &Manager) {
                                 .unwrap_or_else(|| window_title(hwnd));
                             BarApp {
                                 hwnd: h,
-                                icon: bar_app_icon(hwnd),
+                                icon: bar_app_icon(hwnd, icon_px),
                                 label,
                             }
                         })
@@ -6106,6 +6866,7 @@ unsafe fn bar_widget_width(
 /// Paint one widget with its left edge at `x`; returns the width consumed.
 /// Records hit ranges (pills / app buttons / volume) into `lay` for the
 /// wndproc's mouse handling.
+#[allow(clippy::too_many_arguments)]
 unsafe fn bar_widget_draw(
     hdc: HDC,
     wgt: BarWidget,
@@ -6283,7 +7044,49 @@ unsafe fn bar_widget_draw(
 /// center zone is centred in the remaining gap (the title flexes to fill).
 /// The owning monitor's HMONITOR is in GWLP_USERDATA so each bar paints its own
 /// data; the hit ranges land in BAR_LAYOUTS for the mouse handlers.
+/// Per-bar signature of everything the 1 s tick can reveal. Returns true when it
+/// differs from the last tick for this bar (and records the new value), so an
+/// idle desktop repaints roughly once a minute per monitor instead of once a
+/// second. Per bar, not global: each bar has its own timer, and a shared
+/// signature would let whichever fired first starve the others.
+///
+/// Main thread only — every bar timer runs there.
+unsafe fn bar_tick_changed(h: HWND) -> bool {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    {
+        let data = BAR.lock().unwrap();
+        format_clock_widget(&data, &GetLocalTime()).hash(&mut hasher);
+        format_date(&data.date_format, &GetLocalTime()).hash(&mut hasher);
+    }
+    for stat in [
+        &STAT_CPU,
+        &STAT_MEM,
+        &STAT_BAT,
+        &STAT_NET_D,
+        &STAT_NET_U,
+        &STAT_VOL,
+    ] {
+        stat.load(Ordering::Relaxed).hash(&mut hasher);
+    }
+    STAT_MUTE.load(Ordering::Relaxed).hash(&mut hasher);
+    MEDIA_TEXT.lock().unwrap().hash(&mut hasher);
+    let now = hasher.finish();
+    let mut seen = BAR_TICK_SIG.lock().unwrap();
+    seen.get_or_insert_with(HashMap::new)
+        .insert(h.0 as isize, now)
+        != Some(now)
+}
+
+static BAR_TICK_SIG: Mutex<Option<HashMap<isize, u64>>> = Mutex::new(None);
+
 unsafe fn paint_bar(h: HWND) {
+    // Publish this bar's DPI for the whole paint. Every `bar_icon_px()` /
+    // `bar_widget_gap()` call below it reads this, so no call site has to
+    // remember to scale. Safe as a plain static: all bar painting happens on
+    // the main thread, one bar at a time.
+    let dpi = window_dpi(h);
+    BAR_PAINT_DPI.store(dpi, Ordering::Relaxed);
     let mut ps = PAINTSTRUCT::default();
     let win_hdc = BeginPaint(h, &mut ps);
     let hmon = GetWindowLongPtrW(h, GWLP_USERDATA);
@@ -6301,7 +7104,7 @@ unsafe fn paint_bar(h: HWND) {
     FillRect(hdc, &rc, bg_brush);
     let _ = DeleteObject(HGDIOBJ(bg_brush.0));
 
-    let font_raw = BAR_FONT.load(Ordering::Relaxed);
+    let font_raw = bar_font_for(dpi);
     let old_font = if font_raw != 0 {
         Some(SelectObject(hdc, HGDIOBJ(font_raw as *mut c_void)))
     } else {
@@ -6309,8 +7112,8 @@ unsafe fn paint_bar(h: HWND) {
     };
     SetBkMode(hdc, TRANSPARENT);
 
-    let cell = BAR_CELL.load(Ordering::Relaxed) as i32;
-    let pad = BAR_PADDING.load(Ordering::Relaxed) as i32;
+    let cell = dpi_px(BAR_CELL.load(Ordering::Relaxed) as i32, dpi);
+    let pad = dpi_px(BAR_PADDING.load(Ordering::Relaxed) as i32, dpi);
     let mb = data.mons.iter().find(|m| m.hmon == hmon);
     let mut lay = BarLayout {
         cell,
@@ -6461,6 +7264,13 @@ unsafe extern "system" fn bar_wndproc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                     let _ = KillTimer(h, PILL_TIMER_ID);
                     pill_anim_clear(hmon);
                 }
+            } else if w.0 == BAR_TIMER_ID && !bar_tick_changed(h) {
+                // The 1 s tick exists for the clock and the stats. Astur's clock
+                // format has no seconds token, so on an idle desktop this used
+                // to repaint every bar every second to draw the identical
+                // pixels — and `paint_bar` deep-clones the whole BarData each
+                // time (review P-04). Skip when nothing it shows has changed.
+                return LRESULT(0);
             }
             let _ = InvalidateRect(h, None, BOOL(0));
             LRESULT(0)
@@ -6558,6 +7368,17 @@ unsafe extern "system" fn bar_wndproc(h: HWND, msg: u32, w: WPARAM, l: LPARAM) -
         WM_DISPLAYCHANGE => {
             push_cmd(Cmd::RefreshMonitors);
             DefWindowProcW(h, msg, w, l)
+        }
+        // The scale of the monitor this bar sits on changed (Settings ->
+        // Display -> Scale, or a dock/undock). ensure_bars re-derives the
+        // height/margin/radius from the new DPI, and RefreshMonitors re-reserves
+        // the work area and clears the stale-scale snapshots. The font cache is
+        // keyed by DPI, so the next paint builds the new one by itself.
+        WM_DPICHANGED => {
+            ensure_bars();
+            let _ = InvalidateRect(h, None, BOOL(0));
+            push_cmd(Cmd::RefreshMonitors);
+            LRESULT(0)
         }
         _ => DefWindowProcW(h, msg, w, l),
     }
@@ -6676,8 +7497,14 @@ fn config_watcher() {
         if now == last {
             continue;
         }
-        last = now;
+        // Settle before reloading. The settings GUI writes astur.conf and
+        // navbar.conf in a loop; a tick landing between the two used to apply a
+        // MISMATCHED pair and then reload a second time — two full retiles,
+        // two snapshot clears, a visible double flash (review B-10).
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        last = (mtime(&wm), mtime(&nav));
         let cfg = load_config();
+        log_info!("config changed on disk — reloading");
         // Statics the hooks/workers read directly.
         apply_hook_config(&cfg);
         apply_bar_statics(&cfg);
@@ -6869,7 +7696,7 @@ unsafe fn rescue_orphans() {
     }
     let _ = std::fs::remove_file(&path);
     if n > 0 {
-        println!("rescued {n} window(s) hidden by a previous session");
+        log_info!("rescued {n} window(s) hidden by a previous session");
     }
 }
 
@@ -6917,6 +7744,18 @@ unsafe extern "system" fn win_event_proc(
             unmark_hidden_by_us(h);
             if !SUPPRESS.load(Ordering::Relaxed) {
                 push_cmd(Cmd::Add(h));
+            }
+        }
+        EVENT_OBJECT_NAMECHANGE => {
+            // The bar's title widget used to freeze between manager commands:
+            // `update_bar` ran only after a Cmd, and the bar's own 1 s repaint
+            // draws from the cached snapshot (review B-08). Switching a browser
+            // tab or opening another file left a stale title on screen, which
+            // reads as "the bar is frozen".
+            // Only the foreground window's title is shown, so filter here and
+            // keep everything else off the queue.
+            if hwnd == GetForegroundWindow() {
+                push_cmd(Cmd::BarRefresh);
             }
         }
         EVENT_SYSTEM_FOREGROUND => {
@@ -7106,6 +7945,14 @@ const DEFAULT_LAUNCHER_SEL_RADIUS: i32 = 12; // rounded selection pill
 // config is read only by popup/menu threads through UI_CFG.
 static UI_CFG: Mutex<Option<Config>> = Mutex::new(None);
 static LAUNCHER_ENABLED: AtomicBool = AtomicBool::new(true);
+/// Woken when the config changes so the (disabled) IPC worker can re-check
+/// `ipc_enabled` immediately instead of polling for it. The 30 s timeout is a
+/// backstop, not the mechanism.
+static IPC_WAKE: LazyLock<(Mutex<()>, Condvar)> =
+    LazyLock::new(|| (Mutex::new(()), Condvar::new()));
+
+/// Window that had the foreground when the picker opened — the paste target.
+static LAUNCHER_PREV_FG: AtomicIsize = AtomicIsize::new(0);
 static SYSMENU_ENABLED: AtomicBool = AtomicBool::new(true);
 static ALT_TAB_REPLACE: AtomicBool = AtomicBool::new(false);
 static ALT_SWITCHER_MODE: AtomicBool = AtomicBool::new(false);
@@ -7122,41 +7969,73 @@ static POPUP_RADIUS_CFG: AtomicI32 = AtomicI32::new(16);
 static POPUP_BORDER_CFG: AtomicI32 = AtomicI32::new(1);
 static POPUP_FONT_DIRTY: AtomicBool = AtomicBool::new(true);
 
+// Every popup metric is a LOGICAL (100%) pixel in the config and comes back
+// here as a PHYSICAL pixel for the monitor the popup is on. `UI_DPI` is set by
+// launcher_place / sysmenu_layout before anything is measured or drawn, so no
+// call site has to remember to scale. Both popups are single windows that live
+// on one monitor at a time, which is what makes one global sound.
 #[inline]
 fn la_w() -> i32 {
-    LA_W_CFG.load(Ordering::Relaxed)
+    dpi_px(LA_W_CFG.load(Ordering::Relaxed), ui_dpi())
 }
 #[inline]
 fn la_wide_w() -> i32 {
-    LA_WIDE_W_CFG.load(Ordering::Relaxed)
+    dpi_px(LA_WIDE_W_CFG.load(Ordering::Relaxed), ui_dpi())
 }
 #[inline]
 fn la_h() -> i32 {
-    LA_H_CFG.load(Ordering::Relaxed)
+    dpi_px(LA_H_CFG.load(Ordering::Relaxed), ui_dpi())
 }
 #[inline]
 fn la_row_h() -> i32 {
-    LA_ROW_H_CFG.load(Ordering::Relaxed)
+    dpi_px(LA_ROW_H_CFG.load(Ordering::Relaxed), ui_dpi())
 }
 #[inline]
 fn la_pad() -> i32 {
-    LA_PAD_CFG.load(Ordering::Relaxed)
+    dpi_px(LA_PAD_CFG.load(Ordering::Relaxed), ui_dpi())
 }
 #[inline]
 fn la_icon_px() -> i32 {
-    LA_ICON_CFG.load(Ordering::Relaxed)
+    dpi_px(LA_ICON_CFG.load(Ordering::Relaxed), ui_dpi())
 }
 #[inline]
 fn la_sel_radius() -> i32 {
-    LA_SEL_RADIUS_CFG.load(Ordering::Relaxed)
+    dpi_px(LA_SEL_RADIUS_CFG.load(Ordering::Relaxed), ui_dpi())
 }
 #[inline]
 fn popup_radius() -> i32 {
-    POPUP_RADIUS_CFG.load(Ordering::Relaxed)
+    dpi_px(POPUP_RADIUS_CFG.load(Ordering::Relaxed), ui_dpi())
 }
 #[inline]
 fn popup_border() -> i32 {
-    POPUP_BORDER_CFG.load(Ordering::Relaxed)
+    dpi_px(POPUP_BORDER_CFG.load(Ordering::Relaxed), ui_dpi())
+}
+/// Query-row height (logical 54).
+#[inline]
+fn la_header() -> i32 {
+    dpi_px(LAUNCHER_HEADER, ui_dpi())
+}
+/// Wide-mode column-header row height (logical 22).
+#[inline]
+fn la_colhdr() -> i32 {
+    dpi_px(LAUNCHER_COLHDR, ui_dpi())
+}
+#[inline]
+fn col_date_w() -> i32 {
+    dpi_px(COL_DATE_W, ui_dpi())
+}
+#[inline]
+fn col_size_w() -> i32 {
+    dpi_px(COL_SIZE_W, ui_dpi())
+}
+
+/// Adopt the DPI of the monitor a popup is about to appear on. Must run before
+/// any la_* metric is read for that appearance; the popup font is rebuilt when
+/// the scale actually changes.
+unsafe fn set_ui_dpi(dpi: u32) {
+    if UI_DPI.swap(dpi, Ordering::Relaxed) != dpi {
+        POPUP_FONT_DIRTY.store(true, Ordering::Release);
+    }
 }
 
 unsafe fn shape_popup(hwnd: HWND, width: i32, height: i32) {
@@ -7275,6 +8154,9 @@ fn apply_theme(cfg: &Config) {
     if font_changed {
         POPUP_FONT_DIRTY.store(true, Ordering::Release);
     }
+    // Let a sleeping IPC worker notice ipc_enabled without waiting out its
+    // backstop timeout.
+    IPC_WAKE.1.notify_all();
 }
 
 // ---- acrylic backdrop (experimental) ---------------------------------------
@@ -7426,6 +8308,61 @@ unsafe fn clipboard_get_text(h: HWND) -> Option<String> {
     result
 }
 
+/// True when the clipboard owner has asked history tools to leave this copy
+/// alone. Password managers, banking sites and terminals set one of these
+/// formats; Windows' own clipboard history, Ditto and ClipClip all honour them,
+/// and a clipboard history that does not is a way to leak a master password
+/// onto the screen (review S-01).
+///
+/// Two conventions are in play. `ExcludeClipboardContentFromMonitorProcessing`
+/// and `Clipboard Viewer Ignore` mean "skip this entirely" by their presence.
+/// `CanIncludeInClipboardHistory` and `CanUploadToCloudClipboard` are DWORD
+/// opt-outs: present and zero means no. Formats are registered once — the
+/// registration is process-wide and the ids never change.
+unsafe fn clipboard_is_sensitive(h: HWND) -> bool {
+    static FORMATS: OnceLock<[u32; 4]> = OnceLock::new();
+    let ids = *FORMATS.get_or_init(|| {
+        let reg = |name: PCWSTR| RegisterClipboardFormatW(name);
+        [
+            reg(w!("ExcludeClipboardContentFromMonitorProcessing")),
+            reg(w!("Clipboard Viewer Ignore")),
+            reg(w!("CanIncludeInClipboardHistory")),
+            reg(w!("CanUploadToCloudClipboard")),
+        ]
+    });
+    // Presence alone is the signal for the first two.
+    for id in ids.iter().take(2) {
+        if *id != 0 && IsClipboardFormatAvailable(*id).is_ok() {
+            return true;
+        }
+    }
+    // The last two carry a DWORD; 0 = "don't". Reading needs the clipboard open.
+    for id in ids.iter().skip(2) {
+        if *id == 0 || IsClipboardFormatAvailable(*id).is_err() {
+            continue;
+        }
+        if OpenClipboard(h).is_err() {
+            // Cannot check: treat as sensitive. Missing one copy in the history
+            // is a far smaller cost than capturing a password.
+            return true;
+        }
+        let deny = (|| {
+            let data = GetClipboardData(*id).ok()?;
+            let global = windows::Win32::Foundation::HGLOBAL(data.0);
+            let ptr = GlobalLock(global) as *const u32;
+            let value = (!ptr.is_null()).then(|| *ptr);
+            let _ = GlobalUnlock(global);
+            Some(value? == 0)
+        })()
+        .unwrap_or(true);
+        let _ = CloseClipboard();
+        if deny {
+            return true;
+        }
+    }
+    false
+}
+
 unsafe fn clipboard_capture(h: HWND) {
     let cfg = UI_CFG
         .lock()
@@ -7433,6 +8370,10 @@ unsafe fn clipboard_capture(h: HWND) {
         .clone()
         .unwrap_or_else(Config::defaults);
     if !cfg.clipboard_history {
+        return;
+    }
+    if clipboard_is_sensitive(h) {
+        log_debug!("clipboard capture skipped: owner marked the content sensitive");
         return;
     }
     let Some(text) = clipboard_get_text(h) else {
@@ -7444,8 +8385,27 @@ unsafe fn clipboard_capture(h: HWND) {
     items.truncate(cfg.clipboard_limit);
 }
 
+/// Type text into whatever the user was working in. Restores foreground to the
+/// window that had it when the picker opened and WAITS for it, because Ctrl+V
+/// goes wherever the foreground is at the moment it is injected.
 unsafe fn paste_text(h: HWND, text: &str) {
     clipboard_set_text(h, text);
+    let target = LAUNCHER_PREV_FG.swap(0, Ordering::Relaxed);
+    if target != 0 && IsWindow(hwnd_from(target)).as_bool() {
+        focus_window(target);
+        // Up to ~100 ms; foreground changes are asynchronous and the window
+        // may have to repaint first. Bounded so a stuck app cannot hang the
+        // launcher thread.
+        for _ in 0..20 {
+            if GetForegroundWindow().0 as isize == target {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        if GetForegroundWindow().0 as isize != target {
+            log_error!("paste target {target:#x} never regained focus; pasting anyway");
+        }
+    }
     inject_key(VK_CONTROL, false);
     inject_key(VIRTUAL_KEY(0x56), false);
     inject_key(VIRTUAL_KEY(0x56), true);
@@ -7646,7 +8606,8 @@ static LAUNCHER_LAST_MY: AtomicI32 = AtomicI32::new(i32::MIN);
 enum IconJob {
     App(usize),
     File(u64, usize),
-    Bar(String),
+    /// (exe path, physical pixel size to resolve at)
+    Bar(String, i32),
 }
 static ICON_QUEUE: Mutex<VecDeque<IconJob>> = Mutex::new(VecDeque::new());
 static ICON_CV: Condvar = Condvar::new();
@@ -8041,13 +9002,15 @@ fn icon_worker() {
                         _ => continue,
                     },
                     IconJob::File(_, _) => continue,
-                    IconJob::Bar(path) => path.clone(),
+                    IconJob::Bar(path, _) => path.clone(),
                 }
             };
-            let px = if matches!(&job, IconJob::Bar(_)) {
-                bar_icon_px()
-            } else {
-                la_icon_px()
+            // Bar jobs carry the exact size they were queued for; the worker
+            // must not re-read a global, which on a mixed-DPI desk would be
+            // whichever monitor painted last.
+            let px = match &job {
+                IconJob::Bar(_, px) => *px,
+                _ => la_icon_px(),
             };
             let hicon = load_icon(&path, px);
             let mut stored = false;
@@ -8071,12 +9034,12 @@ fn icon_worker() {
                         }
                     }
                     IconJob::File(_, _) => {}
-                    IconJob::Bar(bar_path) => {
+                    IconJob::Bar(bar_path, bar_px) => {
                         let old = BAR_ICONS
                             .lock()
                             .unwrap()
                             .get_or_insert_with(HashMap::new)
-                            .insert(bar_path, hicon);
+                            .insert((bar_path, bar_px), hicon);
                         if let Some(old) = old {
                             release_launcher_icon(old);
                         }
@@ -8266,7 +9229,7 @@ fn launcher_refilter(st: &mut LauncherState) {
             .enumerate()
             .filter_map(|(i, win)| fuzzy_score(query, &win.title_lc).map(|score| (score, i)))
             .collect();
-        windows.sort_by(|a, b| b.0.cmp(&a.0));
+        windows.sort_by_key(|r| std::cmp::Reverse(r.0));
         st.filtered = windows
             .into_iter()
             .map(|(_, i)| Hit::Window(i))
@@ -8292,17 +9255,11 @@ fn launcher_refilter(st: &mut LauncherState) {
             .iter()
             .enumerate()
             .filter_map(|(i, text)| {
-                fuzzy_score(
-                    &q,
-                    &text
-                        .replace('\r', " ")
-                        .replace('\n', " ")
-                        .to_ascii_lowercase(),
-                )
-                .map(|score| (score, i))
+                fuzzy_score(&q, &text.replace(['\r', '\n'], " ").to_ascii_lowercase())
+                    .map(|score| (score, i))
             })
             .collect();
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.sort_by_key(|r| std::cmp::Reverse(r.0));
         filtered.extend(scored.into_iter().map(|(_, i)| Hit::Clipboard(i)));
         st.calc = None;
     } else if let Some(q) = emoji_q {
@@ -8313,7 +9270,7 @@ fn launcher_refilter(st: &mut LauncherState) {
             .enumerate()
             .filter_map(|(i, item)| fuzzy_score(&q, &item.name_lc).map(|score| (score, i)))
             .collect();
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.sort_by_key(|r| std::cmp::Reverse(r.0));
         filtered.extend(scored.into_iter().map(|(_, i)| Hit::Emoji(i)));
         st.calc = None;
     } else {
@@ -8341,7 +9298,7 @@ fn launcher_refilter(st: &mut LauncherState) {
                 })
             })
             .collect();
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.sort_by_key(|r| std::cmp::Reverse(r.0));
         filtered.extend(scored.into_iter().map(|(_, i)| Hit::App(i)));
 
         if cfg.launcher_source_windows {
@@ -8360,7 +9317,7 @@ fn launcher_refilter(st: &mut LauncherState) {
                     })
                 })
                 .collect();
-            windows.sort_by(|a, b| b.0.cmp(&a.0));
+            windows.sort_by_key(|r| std::cmp::Reverse(r.0));
             filtered.extend(windows.into_iter().map(|(_, i)| Hit::Window(i)));
         }
         if cfg.launcher_source_files {
@@ -8521,7 +9478,7 @@ impl FileSearch {
         let mut ds: Option<IUnknown> = None;
         init.GetDataSource(
             None,
-            CLSCTX_INPROC_SERVER.0 as u32,
+            CLSCTX_INPROC_SERVER.0,
             PCWSTR(cs.as_mut_ptr()),
             &IDBInitialize::IID,
             &mut ds,
@@ -8753,6 +9710,8 @@ unsafe fn make_launcher_font() {
         })
         .unwrap_or_else(|| ("Segoe UI".to_string(), 19, 600));
     let mut wname: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    // Logical point-ish size from the config, scaled to the popup's monitor.
+    let size = dpi_px(size, ui_dpi()).max(8);
     let f = CreateFontW(
         -size,
         0,
@@ -8783,6 +9742,12 @@ unsafe fn make_launcher_font() {
 /// (click-outside dismiss + wheel routing), and repaint. `wide` = the Tab column
 /// view; the width is clamped to the work area on small screens.
 unsafe fn launcher_place(h: HWND, wa: RECT, wide: bool) {
+    // Adopt the target monitor's scale BEFORE reading any la_* metric — they
+    // all resolve against it.
+    set_ui_dpi(dpi_at(POINT {
+        x: (wa.left + wa.right) / 2,
+        y: (wa.top + wa.bottom) / 2,
+    }));
     let want = if wide { la_wide_w() } else { la_w() };
     let win_w = want.min(wa.right - wa.left - 48).max(320);
     let x = (wa.left + wa.right) / 2 - win_w / 2;
@@ -8899,7 +9864,7 @@ unsafe fn launcher_reveal_in_folder(path: &str) {
 /// Top of the result list in client coords (below the query row, and below the
 /// column-header row in wide mode).
 fn launcher_list_top(st: &LauncherState) -> i32 {
-    LAUNCHER_HEADER + 6 + if st.wide { LAUNCHER_COLHDR } else { 0 }
+    la_header() + 6 + if st.wide { la_colhdr() } else { 0 }
 }
 
 /// Visible list rows for the current mode + client height.
@@ -8977,7 +9942,7 @@ unsafe fn icon_path(hdc: HDC, x: i32, y: i32, size: i32, points: &[(i32, i32)]) 
 unsafe fn icon_bezier(hdc: HDC, x: i32, y: i32, size: i32, points: &[(i32, i32)]) {
     const MAX_POINTS: usize = 13;
     let mut scaled = [POINT { x: 0, y: 0 }; MAX_POINTS];
-    if points.len() < 4 || points.len() > MAX_POINTS || (points.len() - 1) % 3 != 0 {
+    if points.len() < 4 || points.len() > MAX_POINTS || !(points.len() - 1).is_multiple_of(3) {
         return;
     }
     for (dst, &(px, py)) in scaled.iter_mut().zip(points) {
@@ -9357,7 +10322,7 @@ unsafe fn launcher_paint(h: HWND) {
         left: la_pad(),
         top: 0,
         right: w - la_pad(),
-        bottom: LAUNCHER_HEADER,
+        bottom: la_header(),
     };
     if st.query.is_empty() {
         SetTextColor(hdc, COLORREF(p.dim));
@@ -9387,9 +10352,9 @@ unsafe fn launcher_paint(h: HWND) {
     // Divider under the query row.
     let div = RECT {
         left: la_pad(),
-        top: LAUNCHER_HEADER,
+        top: la_header(),
         right: w - la_pad(),
-        bottom: LAUNCHER_HEADER + 1,
+        bottom: la_header() + 1,
     };
     let dbrush = CreateSolidBrush(COLORREF(p.divider));
     FillRect(hdc, &div, dbrush);
@@ -9404,17 +10369,17 @@ unsafe fn launcher_paint(h: HWND) {
     // Wide-mode column x's, anchored off the right edge; path gets the big share.
     let col_path_w = (w as f64 * 0.40) as i32;
     let path_x = w - la_pad() - 6 - col_path_w;
-    let size_x = path_x - COL_SIZE_W;
-    let date_x = size_x - COL_DATE_W;
+    let size_x = path_x - col_size_w();
+    let date_x = size_x - col_date_w();
     if st.wide {
         // Dim column headers in the band under the query divider.
         SetTextColor(hdc, COLORREF(p.dim));
         let hdr = |x0: i32, x1: i32, label: &str, extra: DRAW_TEXT_FORMAT| {
             let mut r = RECT {
                 left: x0,
-                top: LAUNCHER_HEADER + 2,
+                top: la_header() + 2,
                 right: x1,
-                bottom: LAUNCHER_HEADER + 2 + LAUNCHER_COLHDR,
+                bottom: la_header() + 2 + la_colhdr(),
             };
             let mut v: Vec<u16> = label.encode_utf16().collect();
             DrawTextW(
@@ -9426,7 +10391,7 @@ unsafe fn launcher_paint(h: HWND) {
         };
         hdr(text_left, date_x - 10, "Name", DRAW_TEXT_FORMAT(0));
         hdr(date_x, size_x - 8, "Modified", DRAW_TEXT_FORMAT(0));
-        hdr(size_x, size_x + COL_SIZE_W - 16, "Size", DT_RIGHT);
+        hdr(size_x, size_x + col_size_w() - 16, "Size", DT_RIGHT);
         hdr(path_x, w - la_pad(), "Path", DRAW_TEXT_FORMAT(0));
     }
     let mut want: Vec<IconJob> = Vec::new(); // visible app/file icons still missing
@@ -9499,7 +10464,7 @@ unsafe fn launcher_paint(h: HWND) {
                 let text = match hit {
                     Hit::Calc => format!("{}   (Enter copies)", st.calc.as_deref().unwrap_or("")),
                     Hit::Web => format!("Search the web for \u{201c}{}\u{201d}", st.query.trim()),
-                    Hit::Clipboard(i) => st.clipboard[i].replace('\r', " ").replace('\n', " "),
+                    Hit::Clipboard(i) => st.clipboard[i].replace(['\r', '\n'], " "),
                     Hit::Emoji(i) => st.emoji[i].name.clone(),
                     _ => String::new(),
                 };
@@ -9563,7 +10528,7 @@ unsafe fn launcher_paint(h: HWND) {
             }
             Hit::Window(i) => {
                 let win = &st.windows[i];
-                let icon = bar_app_icon(hwnd_from(win.hwnd));
+                let icon = bar_app_icon(hwnd_from(win.hwnd), la_icon_px());
                 if icon > 1 {
                     let iy = top + (la_row_h() - la_icon_px()) / 2;
                     let _ = DrawIconEx(
@@ -9650,7 +10615,7 @@ unsafe fn launcher_paint(h: HWND) {
                 );
             };
             cell(date_x, size_x - 8, &date_s, DRAW_TEXT_FORMAT(0));
-            cell(size_x, size_x + COL_SIZE_W - 16, &size_s, DT_RIGHT);
+            cell(size_x, size_x + col_size_w() - 16, &size_s, DT_RIGHT);
             cell(path_x, w - la_pad(), path_s, DRAW_TEXT_FORMAT(0));
         }
     }
@@ -9681,6 +10646,11 @@ unsafe extern "system" fn launcher_wndproc(h: HWND, msg: u32, w: WPARAM, l: LPAR
         WM_LAUNCHER => {
             match w.0 {
                 LA_OPEN => {
+                    // Remember what had focus. The picker is NOACTIVATE, but
+                    // hiding it does not synchronously hand foreground back, so
+                    // a paste fired straight after the hide raced focus
+                    // restoration and could land in the wrong window (B-13).
+                    LAUNCHER_PREV_FG.store(GetForegroundWindow().0 as isize, Ordering::Relaxed);
                     {
                         let mut st = LAUNCHER_STATE.lock().unwrap();
                         if !st.loaded {
@@ -10043,6 +11013,16 @@ unsafe extern "system" fn launcher_wndproc(h: HWND, msg: u32, w: WPARAM, l: LPAR
             launcher_paint(h);
             LRESULT(0)
         }
+        // Scale changed under an open popup: re-place it (which re-reads
+        // UI_DPI) and let the next paint rebuild the font.
+        WM_DPICHANGED => {
+            launcher_place(
+                h,
+                launcher_target_work_area(),
+                LAUNCHER_STATE.lock().unwrap().wide,
+            );
+            LRESULT(0)
+        }
         WM_ERASEBKGND => LRESULT(1),
         _ => DefWindowProcW(h, msg, w, l),
     }
@@ -10135,10 +11115,19 @@ const SM_BACK: usize = 5; // up one level (submenu -> root), or close from root
 
 #[inline]
 fn sm_w() -> i32 {
-    SM_W_CFG.load(Ordering::Relaxed)
+    dpi_px(SM_W_CFG.load(Ordering::Relaxed), ui_dpi())
 }
 const SYSMENU_HEADER: i32 = 44;
 const SYSMENU_FOOTER: i32 = 34; // hint / confirm banner
+/// Header/footer bands, scaled to the monitor the menu is on.
+#[inline]
+fn sm_header() -> i32 {
+    dpi_px(SYSMENU_HEADER, ui_dpi())
+}
+#[inline]
+fn sm_footer() -> i32 {
+    dpi_px(SYSMENU_FOOTER, ui_dpi())
+}
 
 static SYSMENU_OPEN: AtomicBool = AtomicBool::new(false);
 static SYSMENU_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -10449,7 +11438,13 @@ unsafe fn sysmenu_exec(act: SysAct) {
         SysAct::RestartAstur => {
             if let Ok(exe) = std::env::current_exe() {
                 restore_all_windows();
-                let _ = std::process::Command::new(exe).spawn();
+                // Explicit hand-off: the replacement waits for this PID to exit
+                // before claiming the single-instance lock, so the two never
+                // manage the same windows at once.
+                let _ = std::process::Command::new(exe)
+                    .arg("--wait-for-pid")
+                    .arg(std::process::id().to_string())
+                    .spawn();
                 std::process::exit(0);
             }
         }
@@ -10463,8 +11458,11 @@ unsafe fn sysmenu_layout(h: HWND) {
     let n = SYSMENU_STATE.lock().unwrap().items.len() as i32;
     let mut pt = POINT::default();
     let _ = GetCursorPos(&mut pt);
+    // Same rule as the launcher: adopt the monitor's scale before reading any
+    // metric.
+    set_ui_dpi(dpi_at(pt));
     let wa = work_area_at(pt);
-    let hgt = SYSMENU_HEADER + 6 + n * la_row_h() + SYSMENU_FOOTER + 6;
+    let hgt = sm_header() + 6 + n * la_row_h() + sm_footer() + 6;
     let x = (wa.left + wa.right) / 2 - sm_w() / 2;
     let y = (wa.top + wa.bottom) / 2 - hgt / 2;
     let _ = SetWindowPos(h, HWND_TOPMOST, x, y, sm_w(), hgt, SWP_NOACTIVATE);
@@ -10482,7 +11480,7 @@ unsafe fn sysmenu_layout(h: HWND) {
 
 /// Menu-row index under a client-space `y` (rows sit under the title, fixed pitch).
 fn sysmenu_row_hit(n: usize, y: i32) -> Option<usize> {
-    let top = SYSMENU_HEADER + 6;
+    let top = sm_header() + 6;
     if y < top {
         return None;
     }
@@ -10563,7 +11561,7 @@ unsafe fn sysmenu_paint(h: HWND) {
         left: la_pad(),
         top: 0,
         right: w - la_pad(),
-        bottom: SYSMENU_HEADER,
+        bottom: sm_header(),
     };
     let mut tv: Vec<u16> = st.title.encode_utf16().collect();
     DrawTextW(
@@ -10574,16 +11572,16 @@ unsafe fn sysmenu_paint(h: HWND) {
     );
     let div = RECT {
         left: la_pad(),
-        top: SYSMENU_HEADER,
+        top: sm_header(),
         right: w - la_pad(),
-        bottom: SYSMENU_HEADER + 1,
+        bottom: sm_header() + 1,
     };
     let db = CreateSolidBrush(COLORREF(p.divider));
     FillRect(hdc, &div, db);
     let _ = DeleteObject(HGDIOBJ(db.0));
 
     for (i, item) in st.items.iter().enumerate() {
-        let top = SYSMENU_HEADER + 6 + i as i32 * la_row_h();
+        let top = sm_header() + 6 + i as i32 * la_row_h();
         let row = RECT {
             left: la_pad(),
             top,
@@ -10660,7 +11658,7 @@ unsafe fn sysmenu_paint(h: HWND) {
         }
     }
 
-    let fy = rc.bottom - SYSMENU_FOOTER;
+    let fy = rc.bottom - sm_footer();
     let label = if st.confirm {
         format!(
             "Press Enter again to {}  \u{2022}  Esc cancels",
@@ -10867,6 +11865,10 @@ unsafe extern "system" fn sysmenu_wndproc(h: HWND, msg: u32, w: WPARAM, l: LPARA
             sysmenu_paint(h);
             LRESULT(0)
         }
+        WM_DPICHANGED => {
+            sysmenu_layout(h);
+            LRESULT(0)
+        }
         WM_ERASEBKGND => LRESULT(1),
         _ => DefWindowProcW(h, msg, w, l),
     }
@@ -11061,6 +12063,426 @@ unsafe fn setup_tray(hinst: HINSTANCE) -> Option<HWND> {
     Some(hwnd)
 }
 
+// =========================================================================
+// Command line
+// =========================================================================
+// Astur is a GUI-subsystem process, so these answer through the console that
+// launched them (when there is one) and, for `--check`, a file as well.
+
+const CLI_HELP: &str = r"Astur - tiling window manager for Windows 10/11
+
+Usage: astur.exe [option]
+
+  (no option)          run the window manager
+  --check              print a diagnostics report (version, DPI awareness,
+                       monitors + their DPI, config paths, log path) and
+                       save it next to the config
+  --version            print the version
+  --help               print this
+  --wait-for-pid <pid> wait for that process to exit, then run (used by the
+                       tray's Restart so two instances never overlap)
+
+Config: %USERPROFILE%\.astur\astur.conf and navbar.conf
+Log:    %USERPROFILE%\.astur\astur.log (set log_level in astur.conf)
+";
+
+enum CliAction {
+    Run,
+    Check,
+    Version,
+    Help,
+    WaitForPid(u32),
+}
+
+fn parse_args() -> CliAction {
+    let mut args = std::env::args().skip(1);
+    match args.next().as_deref() {
+        Some("--check" | "-check" | "/check") => CliAction::Check,
+        Some("--version" | "-V") => CliAction::Version,
+        Some("--help" | "-h" | "-?" | "/?") => CliAction::Help,
+        Some("--wait-for-pid") => match args.next().and_then(|v| v.parse().ok()) {
+            Some(pid) => CliAction::WaitForPid(pid),
+            None => CliAction::Run,
+        },
+        _ => CliAction::Run,
+    }
+}
+
+unsafe fn message_box(message: &str) {
+    let text: Vec<u16> = message
+        .replace('\n', "\r\n")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let _ = MessageBoxW(
+        None,
+        PCWSTR(text.as_ptr()),
+        w!("Astur"),
+        MB_OK | MB_ICONERROR,
+    );
+}
+
+// =========================================================================
+// Single-instance guard
+// =========================================================================
+// Astur ships as a portable exe with no installer, so double-launching it is a
+// normal accident — and two managers is not a degraded experience, it is a
+// broken one: two LL hook chains (every Cmd pushed twice, Alt suppressed
+// twice), two sets of per-monitor bars stacked on each other, two managers
+// issuing conflicting SetWindowPos/SW_HIDE for the same HWNDs, and two crash-
+// rescue files racing on the same path.
+//
+// A named mutex in the Local\ namespace scopes this per user session, which is
+// what we want: two people fast-user-switched on one machine each get their
+// own Astur.
+
+const INSTANCE_MUTEX: PCWSTR = w!(r"Local\astur.instance");
+
+/// Held for the process lifetime by the owning instance. Never released
+/// explicitly — the kernel drops it when the process exits, including on a
+/// crash or a kill, which is exactly the behaviour we want.
+static INSTANCE_LOCK: AtomicIsize = AtomicIsize::new(0);
+
+/// Take the single-instance lock. `false` = another Astur already owns it.
+unsafe fn claim_single_instance() -> bool {
+    let Ok(handle) = CreateMutexW(None, true, INSTANCE_MUTEX) else {
+        return true; // cannot create the mutex: do not block the user's WM
+    };
+    // CreateMutexW succeeds either way; ERROR_ALREADY_EXISTS is how it says
+    // somebody else owns it.
+    if windows::Win32::Foundation::GetLastError()
+        == windows::Win32::Foundation::ERROR_ALREADY_EXISTS
+    {
+        let _ = CloseHandle(handle);
+        return false;
+    }
+    INSTANCE_LOCK.store(handle.0 as isize, Ordering::Relaxed);
+    true
+}
+
+/// Probe without taking it (used by `--check`).
+unsafe fn instance_already_running() -> bool {
+    match OpenMutexW(
+        SYNCHRONIZATION_ACCESS_RIGHTS(PROCESS_SYNCHRONIZE.0),
+        false,
+        INSTANCE_MUTEX,
+    ) {
+        Ok(h) => {
+            let _ = CloseHandle(h);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Restart hand-off: the replacement waits for the old process to exit before
+/// claiming the instance lock, so the two never overlap. Bounded so a wedged
+/// predecessor cannot stop the restart entirely.
+unsafe fn wait_for_predecessor(pid: u32) {
+    let Ok(handle) = OpenProcess(
+        PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+        false,
+        pid,
+    ) else {
+        return; // already gone
+    };
+    let _ = WaitForSingleObject(handle, 10_000);
+    let _ = CloseHandle(handle);
+}
+
+// =========================================================================
+// Diagnostics report  (`astur.exe --check`, and the startup log line)
+// =========================================================================
+// The answer to "how would we find out this is broken, if nobody told us?" for
+// the whole DPI/monitor surface: one paste-ready dump the reporter can attach
+// instead of a video.
+
+unsafe extern "system" fn diag_mon_enum(
+    hmon: HMONITOR,
+    _hdc: HDC,
+    _rc: *mut RECT,
+    lparam: LPARAM,
+) -> BOOL {
+    let v = &mut *(lparam.0 as *mut Vec<(isize, RECT, RECT, bool, u32)>);
+    let mut mi = MONITORINFO {
+        cbSize: core::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if GetMonitorInfoW(hmon, &mut mi).as_bool() {
+        v.push((
+            hmon.0 as isize,
+            mi.rcMonitor,
+            mi.rcWork,
+            mi.dwFlags & 1 != 0, // MONITORINFOF_PRIMARY
+            monitor_dpi(hmon.0 as isize),
+        ));
+    }
+    BOOL(1)
+}
+
+/// One line per monitor: handle, full rect, work area, DPI and scale.
+unsafe fn diag_monitors() -> Vec<String> {
+    let mut raw: Vec<(isize, RECT, RECT, bool, u32)> = Vec::new();
+    let _ = EnumDisplayMonitors(
+        None,
+        None,
+        Some(diag_mon_enum),
+        LPARAM(&mut raw as *mut _ as isize),
+    );
+    raw.sort_by_key(|m| m.1.left);
+    raw.iter()
+        .enumerate()
+        .map(|(i, (hmon, rc, wa, primary, dpi))| {
+            format!(
+                "  [{i}] hmon=0x{hmon:x}{} rect={},{} {}x{} work={},{} {}x{} dpi={dpi} ({}%)",
+                if *primary { " PRIMARY" } else { "" },
+                rc.left,
+                rc.top,
+                rc.right - rc.left,
+                rc.bottom - rc.top,
+                wa.left,
+                wa.top,
+                wa.right - wa.left,
+                wa.bottom - wa.top,
+                dpi * 100 / DPI_BASE,
+            )
+        })
+        .collect()
+}
+
+/// Windows build string, straight out of the registry (no deprecated
+/// GetVersionEx shimming).
+unsafe fn windows_build() -> String {
+    let key = w!(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion");
+    let read_sz = |name: PCWSTR| -> Option<String> {
+        let mut buf = [0u16; 128];
+        let mut cb = (buf.len() * 2) as u32;
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            key,
+            name,
+            RRF_RT_REG_SZ,
+            None,
+            Some(buf.as_mut_ptr() as *mut c_void),
+            Some(&mut cb),
+        )
+        .is_ok()
+        .then(|| {
+            let n = (cb as usize / 2).saturating_sub(1);
+            String::from_utf16_lossy(&buf[..n])
+        })
+    };
+    let read_dword = |name: PCWSTR| -> Option<u32> {
+        let mut v = 0u32;
+        let mut cb = 4u32;
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            key,
+            name,
+            RRF_RT_REG_DWORD,
+            None,
+            Some(&mut v as *mut u32 as *mut c_void),
+            Some(&mut cb),
+        )
+        .is_ok()
+        .then_some(v)
+    };
+    let build: u32 = read_sz(w!("CurrentBuild"))
+        .and_then(|b| b.parse().ok())
+        .unwrap_or(0);
+    // The registry still says "Windows 10 Pro" on Windows 11; the build number
+    // is the only honest discriminator (11 starts at 22000).
+    let name = read_sz(w!("ProductName")).unwrap_or_else(|| "Windows".into());
+    let name = if build >= 22000 {
+        name.replace("Windows 10", "Windows 11")
+    } else {
+        name
+    };
+    match read_dword(w!("UBR")) {
+        Some(ubr) => format!("{name} build {build}.{ubr}"),
+        None => format!("{name} build {build}"),
+    }
+}
+
+/// The report shared by `--check` and (at `info`) the startup log.
+unsafe fn diagnostics_report(dpi_aware: bool) -> String {
+    let mut out = String::new();
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "?".into());
+    out.push_str(&format!("Astur {}\n", env!("CARGO_PKG_VERSION")));
+    out.push_str(&format!("  exe            : {exe}\n"));
+    out.push_str(&format!("  os             : {}\n", windows_build()));
+    out.push_str(&format!(
+        "  dpi awareness  : {}\n",
+        if dpi_aware {
+            "per-monitor-v2"
+        } else {
+            "FAILED TO SET (tiling will be wrong on scaled displays)"
+        }
+    ));
+    out.push_str(&format!(
+        "  system dpi     : {}\n",
+        dpi_at(POINT { x: 0, y: 0 })
+    ));
+    out.push_str("  monitors       :\n");
+    for line in diag_monitors() {
+        out.push_str(&line);
+        out.push('\n');
+    }
+    for (env, name) in [
+        ("ASTUR_CONFIG", "astur.conf"),
+        ("ASTUR_NAVBAR", "navbar.conf"),
+    ] {
+        let path = config_path(env, name);
+        let meta = std::fs::metadata(&path);
+        out.push_str(&format!(
+            "  {name:<14} : {} ({})\n",
+            path.display(),
+            match meta {
+                Ok(m) => format!("{} bytes", m.len()),
+                Err(_) => "missing — defaults in use".to_string(),
+            }
+        ));
+    }
+    out.push_str(&format!(
+        "  log            : {} (log_level = {})\n",
+        log_path().display(),
+        log_level_name(LOG_LEVEL.load(Ordering::Relaxed)),
+    ));
+    {
+        let cfg = load_config();
+        if cfg.unknown_keys.is_empty() {
+            out.push_str("  config keys    : all understood\n");
+        } else {
+            out.push_str(&format!(
+                "  config keys    : {} NOT understood (ignored):\n",
+                cfg.unknown_keys.len()
+            ));
+            for key in &cfg.unknown_keys {
+                out.push_str(&format!("      {key}\n"));
+            }
+        }
+    }
+    out.push_str(&format!(
+        "  hook re-arms   : {}\n",
+        HOOK_REARMS.load(Ordering::Relaxed)
+    ));
+    out.push_str(&format!(
+        "  other instance : {}\n",
+        if instance_already_running() {
+            "YES — a second Astur is running; they will fight over your windows"
+        } else {
+            "no"
+        }
+    ));
+    out
+}
+
+/// Log the environment once at startup. This is the line that turns "it looks
+/// wrong on my laptop" into a diagnosable report.
+unsafe fn log_startup_environment(dpi_aware: bool) {
+    if !dpi_aware {
+        log_error!("SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2) failed; tiling will be wrong on scaled displays");
+    }
+    if !log_on(LOG_INFO) {
+        return;
+    }
+    for line in diagnostics_report(dpi_aware).lines() {
+        log_info!("{}", line.trim_end());
+    }
+}
+
+/// Write `--check` output to the parent console when there is one, and always
+/// to a file, so a GUI-subsystem process can still be asked what it sees.
+unsafe fn run_check() -> i32 {
+    let report = diagnostics_report(true);
+    let path = config_path("ASTUR_CHECK", "astur-check.txt");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let saved = std::fs::write(&path, report.replace('\n', "\r\n")).is_ok();
+    console_write(&report);
+    if saved {
+        console_write(&format!("\nSaved to {}\n", path.display()));
+    }
+    0
+}
+
+/// Write to stdout without `println!`. Release builds are the "windows"
+/// subsystem, so stdout may not exist at all; `println!` panics in that case
+/// and this must not.
+unsafe fn console_write(text: &str) {
+    let handle = match GetStdHandle(STD_OUTPUT_HANDLE) {
+        Ok(h) if !h.is_invalid() && !h.0.is_null() => h,
+        _ => return,
+    };
+    let bytes = text.as_bytes();
+    let mut written = 0u32;
+    let _ = WriteFile(handle, Some(bytes), Some(&mut written), None);
+}
+
+/// Attach to the console that launched us, if any, so `--check` / `--version`
+/// can answer in the terminal the user typed them into. No AllocConsole: a
+/// double-clicked exe should not flash a window that vanishes on exit.
+unsafe fn attach_parent_console() {
+    let already =
+        matches!(GetStdHandle(STD_OUTPUT_HANDLE), Ok(h) if !h.is_invalid() && !h.0.is_null());
+    if already {
+        return; // redirected to a file or pipe: leave it alone
+    }
+    let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+}
+
+// --- foreground lock (system-wide setting; saved and restored) --------------
+
+/// Previous SPI_SETFOREGROUNDLOCKTIMEOUT value, +1 so that 0 means "we never
+/// changed it" and the restore path is a no-op on every other exit route.
+static FOREGROUND_LOCK_PREV: AtomicU32 = AtomicU32::new(0);
+
+unsafe fn disable_foreground_lock() {
+    let mut prev: u32 = 0;
+    let read = SystemParametersInfoW(
+        SPI_GETFOREGROUNDLOCKTIMEOUT,
+        0,
+        Some(&mut prev as *mut u32 as *mut c_void),
+        SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+    )
+    .is_ok();
+    if SystemParametersInfoW(
+        SPI_SETFOREGROUNDLOCKTIMEOUT,
+        0,
+        Some(core::ptr::null_mut()),
+        SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+    )
+    .is_err()
+    {
+        log_error!("could not disable the foreground lock timeout; focus changes may not stick");
+        return;
+    }
+    if read {
+        FOREGROUND_LOCK_PREV.store(prev.saturating_add(1), Ordering::Relaxed);
+        log_info!("foreground lock timeout {prev} -> 0 (restored on exit)");
+    }
+}
+
+/// Put the system setting back. Safe to call more than once and from any exit
+/// path; a hard kill obviously cannot run it, which is why the value is only
+/// ever set to what the user already had.
+unsafe fn restore_foreground_lock() {
+    let saved = FOREGROUND_LOCK_PREV.swap(0, Ordering::Relaxed);
+    if saved == 0 {
+        return;
+    }
+    let mut value = saved - 1;
+    let _ = SystemParametersInfoW(
+        SPI_SETFOREGROUNDLOCKTIMEOUT,
+        0,
+        Some(&mut value as *mut u32 as *mut c_void),
+        SPIF_SENDCHANGE,
+    );
+}
+
 fn main() {
     // Reveal every managed window if any thread panics. `panic = "abort"` skips
     // destructors and a process kill skips the console handler, so without this a
@@ -11068,9 +12490,53 @@ fn main() {
     // runs before the abort.
     std::panic::set_hook(Box::new(|info| {
         restore_on_panic();
-        eprintln!("Astur: panic — managed windows restored. {info}");
+        // Written synchronously: `panic = "abort"` gives the log worker no
+        // chance to drain its queue, and a panic is the one event that must
+        // never be lost.
+        log_sync(&format!("PANIC {info}"));
     }));
     unsafe {
+        // MUST be the first Win32 call: it has to happen before any window, DC
+        // or monitor query, and it cannot be changed afterwards. From here on
+        // GetMonitorInfoW returns physical pixels and SetWindowPos takes them,
+        // on every monitor at every scale. Without it Windows virtualises the
+        // desktop to 96 DPI and tiles land in the top-left 1/scale of a scaled
+        // screen (GitHub #5) — 80% at 125%, 66% at 150%.
+        let dpi_aware = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+        // Command line, before anything is created. `--check`/`--version`/
+        // `--help` answer and exit; `--wait-for-pid` is the restart hand-off.
+        match parse_args() {
+            CliAction::Check => {
+                attach_parent_console();
+                let cfg = load_config();
+                LOG_LEVEL.store(log_level_from_str(&cfg.log_level), Ordering::Relaxed);
+                std::process::exit(run_check());
+            }
+            CliAction::Version => {
+                attach_parent_console();
+                console_write(&format!("Astur {}\n", env!("CARGO_PKG_VERSION")));
+                std::process::exit(0);
+            }
+            CliAction::Help => {
+                attach_parent_console();
+                console_write(CLI_HELP);
+                std::process::exit(0);
+            }
+            CliAction::WaitForPid(pid) => wait_for_predecessor(pid),
+            CliAction::Run => {}
+        }
+
+        // One manager per session. Two would fight over the same windows.
+        if !claim_single_instance() {
+            attach_parent_console();
+            console_write("Astur is already running.\n");
+            message_box(
+                "Astur is already running.\n\nUse the tray icon to open Settings or quit it.",
+            );
+            std::process::exit(0);
+        }
+
         // 1ms timer resolution so the animation worker's frame sleeps are precise
         // (the default ~15.6ms granularity is the main cause of choppy motion).
         let _ = windows::Win32::Media::timeBeginPeriod(1);
@@ -11081,7 +12547,8 @@ fn main() {
         // Load config once here so the bars (main thread) and the manager thread
         // share the exact same settings.
         let cfg = load_config();
-        apply_hook_config(&cfg);
+        apply_hook_config(&cfg); // also applies log_level, so log after this
+        log_startup_environment(dpi_aware.is_ok());
         if cfg.persist_state {
             load_launcher_mru();
         }
@@ -11206,26 +12673,36 @@ fn main() {
                 ..Default::default()
             };
             RegisterClassW(&bwc);
-            make_bar_font(cfg.bar_height, cfg.bar_font_size);
+            // Fonts are built lazily per monitor DPI on first paint.
             ensure_bars();
         }
 
-        let mouse_hook =
-            SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), hinst, 0).expect("mouse hook failed");
-        let kbd_hook = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), hinst, 0)
-            .expect("keyboard hook failed");
+        // Without these Astur is inert, but `panic = "abort"` would turn an
+        // .expect() here into a silent process death with no window and no
+        // message (review W-03). Say why, then leave cleanly.
+        if !install_hooks(hinst) {
+            log_error!("SetWindowsHookExW failed; cannot run");
+            message_box(
+                "Astur could not install its keyboard/mouse hooks.
+
+                 Another program may be blocking them, or Astur may need to be 
+                 run at the same privilege level as the apps you want to manage.",
+            );
+            restore_all_windows();
+            std::process::exit(1);
+        }
 
         // Reveal all managed windows on Ctrl+C / console close so none are left
         // hidden on another workspace when Astur exits.
         let _ = SetConsoleCtrlHandler(Some(console_handler), BOOL(1));
 
         // Reduce the foreground lock so the manager can focus windows reliably.
-        let _ = SystemParametersInfoW(
-            SPI_SETFOREGROUNDLOCKTIMEOUT,
-            0,
-            Some(core::ptr::null_mut()),
-            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-        );
+        // This is SYSTEM-WIDE, affecting every application, so remember the old
+        // value and put it back on a graceful exit (review S-03) — leaving the
+        // machine in a changed state after quitting is not ours to do.
+        if cfg.foreground_lock_disable {
+            disable_foreground_lock();
+        }
 
         // React to windows opening/closing/focusing for tiling. Out-of-context
         // callbacks run on this thread's message loop; own-process events skipped.
@@ -11287,6 +12764,20 @@ fn main() {
             0,
             WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
         );
+        // Title changes, so the bar's title widget tracks browser tabs, editor
+        // files and download progress instead of freezing between commands.
+        // The callback filters to the foreground window (OBJID_WINDOW only —
+        // the proc already drops every id_object != 0), so this noisy event
+        // costs one comparison per fire.
+        let _ = SetWinEventHook(
+            EVENT_OBJECT_NAMECHANGE,
+            EVENT_OBJECT_NAMECHANGE,
+            None,
+            Some(win_event_proc),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+        );
 
         // System tray icon — the control surface for Astur Full (no console in
         // release): left/double-click opens Settings, right-click menu = Settings/Quit.
@@ -11322,6 +12813,8 @@ fn main() {
         std::thread::spawn(sysmenu_thread);
         // Hot-reload config files on save.
         std::thread::spawn(config_watcher);
+        // Put the input hooks back if Windows silently drops them.
+        std::thread::spawn(hook_watchdog);
         // Optional local-only named-pipe command API; blocks on its own worker.
         std::thread::spawn(ipc_worker);
         // Crash rescue: un-hide anything a previous (killed) instance left hidden
@@ -11364,8 +12857,12 @@ fn main() {
             DispatchMessageW(&msg);
         }
 
-        let _ = UnhookWindowsHookEx(kbd_hook);
-        let _ = UnhookWindowsHookEx(mouse_hook);
+        for slot in [&MOUSE_HOOK_H, &KBD_HOOK_H] {
+            let h = slot.swap(0, Ordering::Relaxed);
+            if h != 0 {
+                let _ = UnhookWindowsHookEx(HHOOK(h as *mut c_void));
+            }
+        }
         let _ = windows::Win32::Media::timeEndPeriod(1);
     }
 }
@@ -11373,6 +12870,188 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- workspace model --------------------------------------------------
+    // `Manager` owns window membership. These tests exercise it directly (no
+    // Win32, no real windows), which is the whole point of routing every
+    // membership change through `move_window`/`detach_window`: the bug class
+    // they replaced — a window dropped from `floating`, or left owned by the
+    // monitor it is no longer on — is now checkable in CI.
+
+    fn test_manager(monitors: usize, workspaces: usize) -> Manager {
+        let mons = (0..monitors)
+            .map(|i| {
+                Monitor::new(
+                    0x1000 + i as isize,
+                    RECT {
+                        left: i as i32 * 1920,
+                        top: 0,
+                        right: (i as i32 + 1) * 1920,
+                        bottom: 1080,
+                    },
+                    workspaces,
+                )
+            })
+            .collect();
+        // INDEX is a global mirror of membership; tests must not inherit a
+        // previous test's snapshot, and `locate` falls back to a linear scan.
+        *INDEX.lock().unwrap() = None;
+        Manager {
+            monitors: mons,
+            focused_mon: 0,
+            primary: 0,
+            tiling: true,
+            cfg: Config::defaults(),
+            pending_launch_mon: 0,
+        }
+    }
+
+    /// Every tracked window appears exactly once across every workspace, and
+    /// `floating` is always a subset of `windows`.
+    fn assert_model_sound(mgr: &Manager, expect: &[isize]) {
+        let mut seen: Vec<isize> = Vec::new();
+        for m in &mgr.monitors {
+            for ws in &m.workspaces {
+                for &h in &ws.windows {
+                    assert!(!seen.contains(&h), "window {h:#x} is in two workspaces");
+                    seen.push(h);
+                }
+                for &f in &ws.floating {
+                    assert!(
+                        ws.windows.contains(&f),
+                        "floating {f:#x} is not in its workspace's windows"
+                    );
+                }
+                assert!(
+                    ws.focused == 0 || ws.windows.contains(&ws.focused),
+                    "workspace focus {:#x} is not one of its own windows",
+                    ws.focused
+                );
+            }
+        }
+        seen.sort_unstable();
+        let mut want = expect.to_vec();
+        want.sort_unstable();
+        assert_eq!(seen, want, "windows were lost or duplicated");
+    }
+
+    fn add(mgr: &mut Manager, mi: usize, wi: usize, h: isize, floating: bool) {
+        let ws = &mut mgr.monitors[mi].workspaces[wi];
+        ws.windows.push(h);
+        if floating {
+            ws.floating.push(h);
+        }
+        ws.focused = h;
+    }
+
+    #[test]
+    fn move_window_carries_the_floating_flag() {
+        // B-07: Alt+Shift+<n> on a floated window silently re-tiled it.
+        let mut mgr = test_manager(1, 3);
+        add(&mut mgr, 0, 0, 0xA, true);
+        assert!(mgr.move_window(0xA, 0, 2, None));
+        assert!(mgr.monitors[0].workspaces[2].floating.contains(&0xA));
+        assert!(mgr.monitors[0].workspaces[0].floating.is_empty());
+        assert_model_sound(&mgr, &[0xA]);
+    }
+
+    #[test]
+    fn move_window_across_monitors_changes_owner() {
+        // B-06: the window stayed owned by the monitor it had left, so
+        // switching workspaces there hid a window visible on the other screen.
+        let mut mgr = test_manager(2, 2);
+        add(&mut mgr, 0, 0, 0xA, true);
+        add(&mut mgr, 0, 0, 0xB, false);
+        assert!(mgr.move_window(0xA, 1, 0, None));
+        assert_eq!(mgr.locate(0xA), Some((1, 0)));
+        assert!(mgr.monitors[1].workspaces[0].floating.contains(&0xA));
+        // The source workspace repaired its own focus rather than pointing at a
+        // window it no longer owns.
+        assert_eq!(mgr.monitors[0].workspaces[0].focused, 0xB);
+        assert_model_sound(&mgr, &[0xA, 0xB]);
+    }
+
+    #[test]
+    fn move_window_to_a_missing_destination_changes_nothing() {
+        let mut mgr = test_manager(1, 2);
+        add(&mut mgr, 0, 0, 0xA, false);
+        assert!(!mgr.move_window(0xA, 5, 0, None), "bogus monitor");
+        assert!(!mgr.move_window(0xA, 0, 9, None), "bogus workspace");
+        assert_eq!(mgr.locate(0xA), Some((0, 0)));
+        assert_model_sound(&mgr, &[0xA]);
+    }
+
+    #[test]
+    fn move_window_honours_the_drop_position() {
+        let mut mgr = test_manager(2, 1);
+        add(&mut mgr, 1, 0, 0xB, false);
+        add(&mut mgr, 1, 0, 0xC, false);
+        add(&mut mgr, 0, 0, 0xA, false);
+        assert!(mgr.move_window(0xA, 1, 0, Some(1)));
+        assert_eq!(mgr.monitors[1].workspaces[0].windows, vec![0xB, 0xA, 0xC]);
+        assert_model_sound(&mgr, &[0xA, 0xB, 0xC]);
+    }
+
+    #[test]
+    fn a_window_is_never_lost_by_any_sequence_of_moves() {
+        let mut mgr = test_manager(3, 4);
+        let all: Vec<isize> = (1..=9).collect();
+        for (i, &h) in all.iter().enumerate() {
+            add(&mut mgr, i % 3, i % 4, h, i % 2 == 0);
+        }
+        assert_model_sound(&mgr, &all);
+        // Deterministic shuffle: every window visits every monitor/workspace.
+        for round in 0..7usize {
+            for (i, &h) in all.iter().enumerate() {
+                let to_mi = (i + round) % 3;
+                let to_wi = (i * 2 + round) % 4;
+                assert!(mgr.move_window(h, to_mi, to_wi, None));
+                assert_model_sound(&mgr, &all);
+            }
+        }
+    }
+
+    #[test]
+    fn detach_repairs_focus_and_reports_floating() {
+        let mut mgr = test_manager(1, 1);
+        add(&mut mgr, 0, 0, 0xA, false);
+        add(&mut mgr, 0, 0, 0xB, true);
+        assert_eq!(mgr.detach_window(0xB), Some((0, 0, true)));
+        assert_eq!(mgr.monitors[0].workspaces[0].focused, 0xA);
+        assert_eq!(mgr.detach_window(0xB), None, "already gone");
+        assert_model_sound(&mgr, &[0xA]);
+    }
+
+    #[test]
+    fn focused_never_indexes_out_of_range() {
+        let mut mgr = test_manager(1, 1);
+        add(&mut mgr, 0, 0, 0xA, false);
+        // A stale focused_mon (monitor unplugged mid-command) must not panic —
+        // `panic = "abort"` would take the WM down and strand hidden windows.
+        mgr.focused_mon = 7;
+        let (mi, _, _) = mgr.focused();
+        assert_eq!(mi, 0);
+        mgr.monitors.clear();
+        assert_eq!(mgr.focused(), (0, 0, 0));
+    }
+
+    #[test]
+    fn shrinking_the_workspace_count_keeps_windows_and_focus() {
+        // B-14: the folded workspace's `focused` was dropped on the floor.
+        let mut mgr = test_manager(1, 3);
+        add(&mut mgr, 0, 2, 0xA, false);
+        add(&mut mgr, 0, 2, 0xB, true);
+        mgr.monitors[0].workspaces[2].focused = 0xB;
+        distribute_workspaces(&mut mgr.monitors, 0, 1, true);
+        assert_eq!(mgr.monitors[0].workspaces.len(), 1);
+        assert_eq!(mgr.locate(0xA), Some((0, 0)));
+        assert!(
+            mgr.monitors[0].workspaces[0].floating.contains(&0xB),
+            "folding a workspace must not re-tile its floating windows"
+        );
+        assert_eq!(mgr.monitors[0].workspaces[0].focused, 0xB);
+        assert_model_sound(&mgr, &[0xA, 0xB]);
+    }
 
     #[test]
     fn monitor_cover_requires_all_four_edges() {
